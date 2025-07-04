@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: panaderia-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        value: postgresql://neondb_owner:npg_erPKaF14JmXh@ep-solitary-heart-a8ie6b7v-pooler.eastus2.azure.neon.tech/neondb?sslmode=require&channel_binding=require
+      - key: JWT_SECRET
+        value: un_secreto_muy_largo_y_dificil_de_adivinar_para_proteger_tus_tokens
+      - key: FRONTEND_URL
+        value: https://tu-frontend.vercel.app
+    healthCheckPath: /health

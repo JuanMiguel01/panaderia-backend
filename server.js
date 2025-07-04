@@ -7,43 +7,60 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
-const http = require('http'); // Usado para Socket.IO
-const { Server } = require('socket.io'); // --> NUEVO: Importamos Server de socket.io
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-// Middlewares globales
-
-app.use(express.json());
-
-// Pool de Conexión a la Base de Datos
+// Configuración de la base de datos
 const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_DATABASE,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT,
+    // Para producción, usa DATABASE_URL de Neon
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// --> NUEVO: Creamos el servidor HTTP explícitamente
+// Crear servidor HTTP para Socket.IO
 const server = http.createServer(app);
 
-// --> NUEVO: Instanciamos Socket.IO y lo conectamos al servidor HTTP
+// Configuración de CORS adaptable a producción y desarrollo
+const frontendURL = process.env.NODE_ENV === 'production' 
+    ? process.env.FRONTEND_URL 
+    : "http://localhost:5173";
 
-const frontendURL = "http://localhost:5173"; // Puerto por defecto de Vite
+// Middlewares
+app.use(express.json());
+app.use(cors({ 
+    origin: frontendURL,
+    credentials: true
+}));
 
-// Configura CORS para Express
-app.use(cors({ origin: frontendURL }));
-
-// Configura CORS para Socket.IO
+// Configuración de Socket.IO
 const io = new Server(server, {
     cors: {
         origin: frontendURL,
-        methods: ["GET", "POST", "PATCH", "DELETE"]
+        methods: ["GET", "POST", "PATCH", "DELETE"],
+        credentials: true
     }
 });
 
+// Health check endpoint (requerido para muchos servicios de hosting)
+app.get('/health', (req, res) => {
+    res.status(200).json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development'
+    });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'Panadería API - Servidor funcionando correctamente',
+        version: '1.0.0',
+        environment: process.env.NODE_ENV || 'development'
+    });
+});
 
 // ===================================
 //  2. MIDDLEWARES DE AUTENTICACIÓN
@@ -85,7 +102,7 @@ app.post('/api/auth/register', async (req, res) => {
         
         const userData = newUser.rows[0];
         
-        // --> NUEVO: Emitir evento de nuevo usuario registrado a todos los administradores
+        // Emitir evento de nuevo usuario registrado a todos los administradores
         io.emit('user:registered', {
             id: userData.id,
             email: userData.email,
@@ -125,6 +142,7 @@ app.post('/api/auth/login', async (req, res) => {
         res.status(500).json({ message: "Error interno del servidor." });
     }
 });
+
 // ===================================
 //  3.b ENDPOINTS DE USUARIOS (SOLO ADMIN)
 // ===================================
@@ -149,7 +167,7 @@ app.patch('/api/users/:id/approve', authenticateToken, isAdmin, async (req, res)
         
         const approvedUser = result.rows[0];
         
-        // --> NUEVO: Emitir evento de usuario aprobado a todos los clientes conectados
+        // Emitir evento de usuario aprobado a todos los clientes conectados
         io.emit('user:approved', {
             userId: approvedUser.id,
             email: approvedUser.email,
@@ -189,7 +207,7 @@ app.get('/api/batches', authenticateToken, async (req, res) => {
                     quantityMade: row.quantity_made,
                     price: row.price,
                     date: row.date,
-                    createdBy: row.created_by_email, // Enviamos el email para mostrar en el frontend
+                    createdBy: row.created_by_email,
                     sales: []
                 };
             }
@@ -217,7 +235,6 @@ app.post('/api/batches', authenticateToken, async (req, res) => {
     const createdBy = req.user.userId;
 
     try {
-        // Obtenemos también el email del usuario para emitirlo en el evento
         const query = `
             WITH new_batch AS (
                 INSERT INTO bread_batches (bread_type, quantity_made, price, created_by) 
@@ -236,11 +253,11 @@ app.post('/api/batches', authenticateToken, async (req, res) => {
             quantityMade: newBatchData.quantity_made,
             price: newBatchData.price,
             date: newBatchData.date,
-            createdBy: newBatchData.created_by_email, // Usamos el email
+            createdBy: newBatchData.created_by_email,
             sales: []
         };
         
-        // --> NUEVO: Emitir evento de nuevo lote a todos los clientes
+        // Emitir evento de nuevo lote a todos los clientes
         io.emit('batch:created', newBatch);
 
         res.status(201).json(newBatch);
@@ -254,10 +271,9 @@ app.post('/api/batches', authenticateToken, async (req, res) => {
 app.delete('/api/batches/:batchId', authenticateToken, isAdmin, async (req, res) => {
     const { batchId } = req.params;
     try {
-        // Gracias a "ON DELETE CASCADE" en la tabla 'sales', no necesitamos borrar las ventas manualmente.
         await pool.query('DELETE FROM bread_batches WHERE id = $1', [batchId]);
-
-        // --> NUEVO: Emitir evento de lote eliminado a todos los clientes
+        
+        // Emitir evento de lote eliminado a todos los clientes
         io.emit('batch:deleted', parseInt(batchId));
 
         res.status(200).json({ message: 'Lote eliminado correctamente', batchId: parseInt(batchId) });
@@ -280,10 +296,10 @@ app.post('/api/batches/:batchId/sales', authenticateToken, async (req, res) => {
 
         const newSale = rows[0];
 
-        // --> NUEVO: Emitir evento de nueva venta a todos los clientes
+        // Emitir evento de nueva venta a todos los clientes
         io.emit('sale:created', {
             batchId: newSale.batch_id,
-            sale: { // Formateamos para que coincida con la estructura del frontend
+            sale: {
                 id: newSale.id,
                 personName: newSale.person_name,
                 quantitySold: newSale.quantity_sold,
@@ -293,7 +309,7 @@ app.post('/api/batches/:batchId/sales', authenticateToken, async (req, res) => {
             }
         });
 
-        res.status(201).json(newSale); // La respuesta a la petición original sigue siendo la misma
+        res.status(201).json(newSale);
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: "Error interno del servidor" });
@@ -305,7 +321,6 @@ app.patch('/api/batches/:batchId/sales/:saleId', authenticateToken, async (req, 
     const { saleId } = req.params;
     const { isPaid, isDelivered } = req.body;
 
-    // Restricción para que solo admins puedan marcar como pagado
     if (typeof isPaid !== 'undefined' && req.user.role !== 'admin') {
         return res.status(403).json({ message: 'Solo los administradores pueden cambiar el estado de pago.' });
     }
@@ -325,10 +340,10 @@ app.patch('/api/batches/:batchId/sales/:saleId', authenticateToken, async (req, 
         
         const updatedSale = rows[0];
 
-        // --> NUEVO: Emitir evento de venta actualizada a todos los clientes
+        // Emitir evento de venta actualizada a todos los clientes
         io.emit('sale:updated', {
             batchId: updatedSale.batch_id,
-            sale: { // Formateamos para que coincida con la estructura del frontend
+            sale: {
                 id: updatedSale.id,
                 personName: updatedSale.person_name,
                 quantitySold: updatedSale.quantity_sold,
@@ -350,7 +365,6 @@ app.delete('/api/batches/:batchId/sales/:saleId', authenticateToken, async (req,
     const { batchId, saleId } = req.params;
     
     try {
-        // Verificar que la venta existe y pertenece al lote especificado
         const checkQuery = 'SELECT * FROM sales WHERE id = $1 AND batch_id = $2';
         const checkResult = await pool.query(checkQuery, [saleId, batchId]);
         
@@ -358,7 +372,6 @@ app.delete('/api/batches/:batchId/sales/:saleId', authenticateToken, async (req,
             return res.status(404).json({ message: 'Venta no encontrada' });
         }
         
-        // Eliminar la venta
         await pool.query('DELETE FROM sales WHERE id = $1', [saleId]);
         
         // Emitir evento de venta eliminada a todos los clientes
@@ -391,11 +404,33 @@ io.on('connection', (socket) => {
 });
 
 // ===================================
-//  6. INICIO DEL SERVIDOR
+//  6. MANEJO DE ERRORES GLOBAL
 // ===================================
 
-// --> MODIFICADO: Usamos 'server.listen' en lugar de 'app.listen'
-server.listen(port, () => {
-    console.log(`🚀 Servidor backend corriendo en http://localhost:${port}`);
-    console.log(`📡 Socket.IO escuchando para conexiones en tiempo real.`);
+// Middleware para manejo de errores
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({ 
+        message: 'Error interno del servidor',
+        error: process.env.NODE_ENV === 'production' ? 'Algo salió mal!' : err.message
+    });
+});
+
+// Manejo de rutas no encontradas
+app.use('*', (req, res) => {
+    res.status(404).json({ 
+        message: 'Ruta no encontrada',
+        path: req.originalUrl
+    });
+});
+
+// ===================================
+//  7. INICIO DEL SERVIDOR
+// ===================================
+
+server.listen(port, '0.0.0.0', () => {
+    console.log(`🚀 Servidor backend corriendo en puerto ${port}`);
+    console.log(`📡 Socket.IO escuchando para conexiones en tiempo real`);
+    console.log(`🌍 Entorno: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔗 Frontend URL: ${frontendURL}`);
 });
