@@ -146,7 +146,85 @@ app.post('/api/auth/login', async (req, res) => {
 // ===================================
 //  3.b ENDPOINTS DE USUARIOS (SOLO ADMIN)
 // ===================================
+// server.js
 
+// ===================================
+//  3.b ENDPOINTS DE USUARIOS (SOLO ADMIN)
+// ===================================
+
+// Obtener todos los usuarios ACTIVOS
+app.get('/api/users/active', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "SELECT id, email, role, created_at, permissions FROM users WHERE is_approved = TRUE ORDER BY created_at DESC"
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Error al obtener usuarios activos" });
+    }
+});
+
+// Crear un nuevo usuario (admin-only)
+app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
+    const { email, password, role, permissions } = req.body;
+    if (!email || !password || !role) {
+        return res.status(400).json({ message: 'Email, contraseña y rol son requeridos.' });
+    }
+    try {
+        const salt = await bcrypt.genSalt(10);
+        const password_hash = await bcrypt.hash(password, salt);
+        const newUser = await pool.query(
+            `INSERT INTO users (email, password_hash, role, permissions, is_approved) 
+             VALUES ($1, $2, $3, $4, TRUE) 
+             RETURNING id, email, role, is_approved, created_at, permissions`,
+            [email, password_hash, role, permissions || {}] // Asegura que permissions sea un objeto
+        );
+        res.status(201).json(newUser.rows[0]);
+    } catch (error) {
+        if (error.code === '23505') return res.status(400).json({ message: "El email ya está en uso." });
+        console.error(error);
+        res.status(500).json({ message: "Error interno del servidor al crear usuario." });
+    }
+});
+
+// Actualizar rol y permisos de un usuario
+app.put('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { role, permissions } = req.body;
+
+    if (!role) {
+        return res.status(400).json({ message: 'El rol es requerido.' });
+    }
+    try {
+        const result = await pool.query(
+            "UPDATE users SET role = $1, permissions = $2 WHERE id = $3 RETURNING id, email, role, permissions",
+            [role, permissions, id]
+        );
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: "Usuario no encontrado" });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Error al actualizar usuario" });
+    }
+});
+
+// Eliminar un usuario (o rechazar uno pendiente)
+app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query("DELETE FROM users WHERE id = $1", [id]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: "Usuario no encontrado para eliminar" });
+        }
+        res.status(204).send(); // 204 No Content
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Error al eliminar usuario" });
+    }
+});
 // Obtener todos los usuarios pendientes de aprobación
 app.get('/api/users/pending', authenticateToken, isAdmin, async (req, res) => {
     try {
