@@ -147,118 +147,258 @@ app.post('/api/auth/login', async (req, res) => {
 //  3.b ENDPOINTS DE USUARIOS (SOLO ADMIN)
 // ===================================
 // server.js
+// Reemplaza las funciones relacionadas con usuarios en tu server.js
 
 // ===================================
-//  3.b ENDPOINTS DE USUARIOS (SOLO ADMIN)
+//  3.b ENDPOINTS DE USUARIOS (SOLO ADMIN) - VERSIÓN CORREGIDA
 // ===================================
-
-// Obtener todos los usuarios ACTIVOS
-app.get('/api/users/active', authenticateToken, isAdmin, async (req, res) => {
+app.get('/api/users/pending', authenticateToken, isAdmin, async (req, res) => {
     try {
         const result = await pool.query(
-            "SELECT id, email, role, created_at, permissions FROM users WHERE is_approved = TRUE ORDER BY created_at DESC"
+            "SELECT id, email, role, created_at FROM users WHERE is_approved = FALSE ORDER BY created_at DESC"
         );
+        console.log('📋 Usuarios pendientes encontrados:', result.rows.length);
         res.json(result.rows);
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Error al obtener usuarios activos" });
+        console.error('Error en /api/users/pending:', error);
+        res.status(500).json({ message: "Error al obtener usuarios pendientes" });
     }
 });
 
-// Crear un nuevo usuario (admin-only)
+// 2. Aprobar un usuario pendiente
+app.patch('/api/users/:id/approve', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query(
+            "UPDATE users SET is_approved = TRUE WHERE id = $1 AND is_approved = FALSE RETURNING id, email, role, created_at",
+            [parseInt(id)]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: "Usuario no encontrado o ya aprobado" });
+        }
+
+        const approvedUser = result.rows[0];
+
+        // Emitir evento de usuario aprobado
+        io.emit('user:approved', {
+            id: approvedUser.id,
+            email: approvedUser.email,
+            role: approvedUser.role,
+            created_at: approvedUser.created_at
+        });
+
+        console.log('✅ Usuario aprobado:', approvedUser.email);
+        res.json({ message: "Usuario aprobado correctamente", user: approvedUser });
+    } catch (error) {
+        console.error('Error aprobando usuario:', error);
+        res.status(500).json({ message: "Error al aprobar usuario" });
+    }
+});
+
+// 3. Eliminar usuario (funciona tanto para pendientes como activos)
+app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        // Verificar que no sea el propio usuario
+        if (parseInt(id) === req.user.userId) {
+            return res.status(400).json({ message: "No puedes eliminar tu propia cuenta" });
+        }
+
+        const result = await pool.query(
+            "DELETE FROM users WHERE id = $1 RETURNING id, email",
+            [parseInt(id)]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: "Usuario no encontrado" });
+        }
+
+        const deletedUser = result.rows[0];
+        console.log('🗑️ Usuario eliminado:', deletedUser.email);
+        res.json({ message: "Usuario eliminado correctamente", user: deletedUser });
+    } catch (error) {
+        console.error('Error eliminando usuario:', error);
+        res.status(500).json({ message: "Error al eliminar usuario" });
+    }
+});
+// Obtener todos los usuarios ACTIVOS (con manejo de errores mejorado)
+app.get('/api/users/active', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        // Primero verificar si la columna permissions existe
+        const result = await pool.query(`
+            SELECT id, email, role, created_at,
+                CASE 
+                    WHEN column_name IS NOT NULL THEN permissions
+                    ELSE '{}'::jsonb
+                END as permissions
+            FROM users u
+            LEFT JOIN information_schema.columns c ON c.table_name = 'users' AND c.column_name = 'permissions'
+            WHERE u.is_approved = TRUE 
+            ORDER BY u.created_at DESC
+        `);
+        
+        // Si la consulta anterior no funciona, usar una consulta más simple
+        if (result.rows.length === 0) {
+            const fallbackResult = await pool.query(
+                "SELECT id, email, role, created_at FROM users WHERE is_approved = TRUE ORDER BY created_at DESC"
+            );
+            
+            // Agregar permissions por defecto basado en el rol
+            const usersWithPermissions = fallbackResult.rows.map(user => ({
+                ...user,
+                permissions: getDefaultPermissions(user.role)
+            }));
+            
+            return res.json(usersWithPermissions);
+        }
+        
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error en /api/users/active:', error);
+        
+        // Intentar consulta de respaldo sin permissions
+        try {
+            const fallbackResult = await pool.query(
+                "SELECT id, email, role, created_at FROM users WHERE is_approved = TRUE ORDER BY created_at DESC"
+            );
+            
+            const usersWithPermissions = fallbackResult.rows.map(user => ({
+                ...user,
+                permissions: getDefaultPermissions(user.role)
+            }));
+            
+            res.json(usersWithPermissions);
+        } catch (fallbackError) {
+            console.error('Error en consulta de respaldo:', fallbackError);
+            res.status(500).json({ message: "Error al obtener usuarios activos" });
+        }
+    }
+});
+
+// Función auxiliar para obtener permisos por defecto según el rol
+function getDefaultPermissions(role) {
+    switch (role) {
+        case 'admin':
+            return {
+                canViewStockCard: true,
+                canManageStock: true,
+                canViewAllSales: true,
+                canDeleteSales: true
+            };
+        case 'manager':
+            return {
+                canViewStockCard: true,
+                canManageStock: true,
+                canViewAllSales: true,
+                canDeleteSales: false
+            };
+        default:
+            return {
+                canViewStockCard: false,
+                canManageStock: false,
+                canViewAllSales: false,
+                canDeleteSales: false
+            };
+    }
+}
+
+// Crear un nuevo usuario (admin-only) - VERSIÓN CORREGIDA
 app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
     const { email, password, role, permissions } = req.body;
     if (!email || !password || !role) {
         return res.status(400).json({ message: 'Email, contraseña y rol son requeridos.' });
     }
+    
     try {
         const salt = await bcrypt.genSalt(10);
         const password_hash = await bcrypt.hash(password, salt);
-        const newUser = await pool.query(
-            `INSERT INTO users (email, password_hash, role, permissions, is_approved) 
-             VALUES ($1, $2, $3, $4, TRUE) 
-             RETURNING id, email, role, is_approved, created_at, permissions`,
-            [email, password_hash, role, permissions || {}] // Asegura que permissions sea un objeto
-        );
-        res.status(201).json(newUser.rows[0]);
+        
+        const defaultPermissions = permissions || getDefaultPermissions(role);
+        
+        // Verificar si la columna permissions existe
+        let query, values;
+        try {
+            query = `INSERT INTO users (email, password_hash, role, permissions, is_approved) 
+                     VALUES ($1, $2, $3, $4, TRUE) 
+                     RETURNING id, email, role, is_approved, created_at, permissions`;
+            values = [email, password_hash, role, defaultPermissions];
+            
+            const newUser = await pool.query(query, values);
+            res.status(201).json(newUser.rows[0]);
+        } catch (columnError) {
+            // Si falla, es probable que la columna permissions no exista
+            console.log('Columna permissions no existe, usando consulta sin permissions');
+            query = `INSERT INTO users (email, password_hash, role, is_approved) 
+                     VALUES ($1, $2, $3, TRUE) 
+                     RETURNING id, email, role, is_approved, created_at`;
+            values = [email, password_hash, role];
+            
+            const newUser = await pool.query(query, values);
+            const userWithPermissions = {
+                ...newUser.rows[0],
+                permissions: defaultPermissions
+            };
+            res.status(201).json(userWithPermissions);
+        }
     } catch (error) {
-        if (error.code === '23505') return res.status(400).json({ message: "El email ya está en uso." });
-        console.error(error);
+        if (error.code === '23505') {
+            return res.status(400).json({ message: "El email ya está en uso." });
+        }
+        console.error('Error creando usuario:', error);
         res.status(500).json({ message: "Error interno del servidor al crear usuario." });
     }
 });
 
-// Actualizar rol y permisos de un usuario
+// REEMPLAZA tu endpoint PUT /api/users/:id actual con este código corregido
 app.put('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
     const { id } = req.params;
     const { role, permissions } = req.body;
 
+    console.log('🔄 Actualizando usuario:', { id, role, permissions });
+
     if (!role) {
         return res.status(400).json({ message: 'El rol es requerido.' });
     }
+    
     try {
-        const result = await pool.query(
-            "UPDATE users SET role = $1, permissions = $2 WHERE id = $3 RETURNING id, email, role, permissions",
-            [role, permissions, id]
-        );
+        // Usar los permisos enviados desde el frontend o los por defecto
+        const finalPermissions = permissions || getDefaultPermissions(role);
+        
+        console.log('📝 Permisos finales a aplicar:', finalPermissions);
+        
+        // Query más simple y confiable
+        const query = `
+            UPDATE users 
+            SET role = $1, permissions = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE id = $3 AND is_approved = TRUE
+            RETURNING id, email, role, permissions, created_at, updated_at
+        `;
+        
+        const values = [role, JSON.stringify(finalPermissions), parseInt(id)];
+        
+        console.log('🔍 Ejecutando query con valores:', values);
+        
+        const result = await pool.query(query, values);
+        
         if (result.rowCount === 0) {
+            console.log('❌ Usuario no encontrado o no activo con ID:', id);
             return res.status(404).json({ message: "Usuario no encontrado" });
         }
-        res.json(result.rows[0]);
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Error al actualizar usuario" });
-    }
-});
-
-// Eliminar un usuario (o rechazar uno pendiente)
-app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
-    const { id } = req.params;
-    try {
-        const result = await pool.query("DELETE FROM users WHERE id = $1", [id]);
-        if (result.rowCount === 0) {
-            return res.status(404).json({ message: "Usuario no encontrado para eliminar" });
-        }
-        res.status(204).send(); // 204 No Content
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Error al eliminar usuario" });
-    }
-});
-// Obtener todos los usuarios pendientes de aprobación
-app.get('/api/users/pending', authenticateToken, isAdmin, async (req, res) => {
-    try {
-        const result = await pool.query("SELECT id, email, role, created_at FROM users WHERE is_approved = FALSE");
-        res.json(result.rows);
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Error al obtener usuarios pendientes" });
-    }
-});
-
-// Aprobar un usuario por su ID
-app.patch('/api/users/:id/approve', authenticateToken, isAdmin, async (req, res) => {
-    const { id } = req.params;
-    try {
-        const result = await pool.query("UPDATE users SET is_approved = TRUE WHERE id = $1 RETURNING id, email, role, is_approved", [id]);
-        if (result.rowCount === 0) return res.status(404).json({ message: "Usuario no encontrado" });
         
-        const approvedUser = result.rows[0];
+        const updatedUser = result.rows[0];
+        console.log('✅ Usuario actualizado correctamente:', updatedUser);
         
-        // Emitir evento de usuario aprobado a todos los clientes conectados
-        io.emit('user:approved', {
-            userId: approvedUser.id,
-            email: approvedUser.email,
-            role: approvedUser.role
+        res.json(updatedUser);
+        
+    } catch (error) {
+        console.error('💥 Error actualizando usuario:', error);
+        res.status(500).json({ 
+            message: "Error al actualizar usuario",
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Error interno'
         });
-        
-        res.json({ message: "Usuario aprobado correctamente", user: approvedUser });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: "Error al aprobar usuario" });
     }
 });
-
 // ===================================
 //  4. ENDPOINTS DE LA APLICACIÓN (LOTES Y VENTAS)
 // ===================================
