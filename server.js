@@ -394,7 +394,7 @@ app.put('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
     }
 });
 // ===================================
-//  4. ENDPOINTS DE LA APLICACIÓN (LOTES Y VENTAS)
+//  4 a. ENDPOINTS DE LA APLICACIÓN (LOTES Y VENTAS)
 // ===================================
 // Obtener todos los lotes con sus ventas
 // Obtener todos los lotes con sus ventas - MODIFICADO
@@ -606,7 +606,107 @@ app.delete('/api/batches/:batchId/sales/:saleId', authenticateToken, isAdmin, as
         res.status(500).json({ message: "Error interno del servidor" });
     }
 });
+// ===================================
+//  4.b ENDPOINTS DE INVENTARIO DE INSUMOS (NUEVO)
+// ===================================
 
+// Obtener todos los insumos del inventario
+app.get('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const { rows } = await pool.query('SELECT * FROM inventory_items ORDER BY name ASC');
+        res.json(rows);
+    } catch (error) {
+        console.error('Error fetching inventory items:', error);
+        res.status(500).json({ message: "Error interno del servidor" });
+    }
+});
+
+// Crear un nuevo insumo en el inventario
+app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
+    const { name, quantity, unit } = req.body;
+    if (!name || quantity === undefined || !unit) {
+        return res.status(400).json({ message: 'Nombre, cantidad y unidad son requeridos.' });
+    }
+    try {
+        const { rows } = await pool.query(
+            'INSERT INTO inventory_items (name, quantity, unit) VALUES ($1, $2, $3) RETURNING *',
+            [name, Number(quantity), unit]
+        );
+        res.status(201).json(rows[0]);
+    } catch (error) {
+        if (error.code === '23505') { // unique_violation
+            return res.status(400).json({ message: "El insumo ya existe." });
+        }
+        console.error('Error creating inventory item:', error);
+        res.status(500).json({ message: "Error interno del servidor" });
+    }
+});
+
+// Actualizar la cantidad de un insumo (añadir o restar)
+app.patch('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { change } = req.body; // 'change' puede ser positivo (añadir) o negativo (restar)
+    if (change === undefined) {
+        return res.status(400).json({ message: 'El campo "change" es requerido.' });
+    }
+    try {
+        const { rows } = await pool.query(
+            'UPDATE inventory_items SET quantity = quantity + $1 WHERE id = $2 RETURNING *',
+            [Number(change), id]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'Insumo no encontrado.' });
+        }
+        res.json(rows[0]);
+    } catch (error) {
+        console.error('Error updating inventory item:', error);
+        res.status(500).json({ message: "Error interno del servidor" });
+    }
+});
+
+// Eliminar un insumo del inventario
+app.delete('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query('DELETE FROM inventory_items WHERE id = $1', [id]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: 'Insumo no encontrado.' });
+        }
+        res.status(204).send(); // 204 No Content
+    } catch (error) {
+        console.error('Error deleting inventory item:', error);
+        res.status(500).json({ message: "Error interno del servidor" });
+    }
+});
+
+
+// ===================================
+//  4.c ENDPOINTS DE EDICIÓN DE LOTES (NUEVO)
+// ===================================
+
+// Actualizar la fecha de un lote
+app.patch('/api/batches/:batchId/date', authenticateToken, isAdmin, async (req, res) => {
+    const { batchId } = req.params;
+    const { date } = req.body;
+    if (!date) {
+        return res.status(400).json({ message: 'La fecha es requerida.' });
+    }
+    try {
+        const { rows } = await pool.query(
+            'UPDATE bread_batches SET date = $1 WHERE id = $2 RETURNING *',
+            [date, batchId]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'Lote no encontrado.' });
+        }
+        // Emitir un evento para que los clientes actualicen los datos
+        io.emit('batch:updated', { batchId: parseInt(batchId) });
+        res.json(rows[0]);
+    } catch (error) {
+        console.error('Error updating batch date:', error);
+        res.status(500).json({ message: "Error interno del servidor" });
+    }
+});
 
 // ===================================
 //  5. GESTIÓN DE CONEXIONES SOCKET.IO
