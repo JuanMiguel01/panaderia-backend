@@ -645,22 +645,66 @@ app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
 // Actualizar la cantidad de un insumo (añadir o restar)
 app.patch('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) => {
     const { id } = req.params;
-    const { change } = req.body; // 'change' puede ser positivo (añadir) o negativo (restar)
-    if (change === undefined) {
-        return res.status(400).json({ message: 'El campo "change" es requerido.' });
+    const { change } = req.body;
+    const userId = req.user.userId; // Obtenemos el ID del usuario desde el token
+
+    if (change === undefined || isNaN(Number(change))) {
+        return res.status(400).json({ message: 'El campo "change" numérico es requerido.' });
     }
+
+    const client = await pool.connect(); // Usar una transacción para seguridad
     try {
-        const { rows } = await pool.query(
-            'UPDATE inventory_items SET quantity = quantity + $1 WHERE id = $2 RETURNING *',
-            [Number(change), id]
-        );
-        if (rows.length === 0) {
-            return res.status(404).json({ message: 'Insumo no encontrado.' });
+        await client.query('BEGIN');
+
+        // 1. Obtener estado actual del ítem
+        const currentItemRes = await client.query('SELECT quantity FROM inventory_items WHERE id = $1 FOR UPDATE', [id]);
+        if (currentItemRes.rows.length === 0) {
+            throw new Error('Insumo no encontrado');
         }
-        res.json(rows[0]);
+        const quantity_before = currentItemRes.rows[0].quantity;
+        const quantity_after = Number(quantity_before) + Number(change);
+
+        // 2. Actualizar el insumo
+        const updatedItem = await client.query(
+            'UPDATE inventory_items SET quantity = $1 WHERE id = $2 RETURNING *',
+            [quantity_after, id]
+        );
+
+        // 3. Insertar el registro en el log
+        await client.query(
+            `INSERT INTO inventory_logs (item_id, user_id, change_amount, quantity_before, quantity_after)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [id, userId, Number(change), quantity_before, quantity_after]
+        );
+
+        await client.query('COMMIT');
+        res.json(updatedItem.rows[0]);
+
     } catch (error) {
-        console.error('Error updating inventory item:', error);
-        res.status(500).json({ message: "Error interno del servidor" });
+        await client.query('ROLLBACK');
+        console.error('Error actualizando inventario con log:', error);
+        res.status(500).json({ message: error.message || "Error interno del servidor" });
+    } finally {
+        client.release();
+    }
+});
+
+// AÑADIR este nuevo endpoint para obtener los logs
+app.get('/api/inventory/:id/logs', authenticateToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { rows } = await pool.query(`
+            SELECT l.*, u.email as user_email
+            FROM inventory_logs l
+            JOIN users u ON l.user_id = u.id
+            WHERE l.item_id = $1
+            ORDER BY l.created_at DESC
+            LIMIT 50; -- Limitar para no sobrecargar
+        `, [id]);
+        res.json(rows);
+    } catch (error) {
+        console.error('Error fetching inventory logs:', error);
+        res.status(500).json({ message: "Error al obtener historial de insumo" });
     }
 });
 
