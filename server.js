@@ -119,6 +119,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // Inicio de sesión de usuario
+
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ message: 'Email y contraseña son requeridos.' });
@@ -133,15 +134,24 @@ app.post('/api/auth/login', async (req, res) => {
         
         if (!user.is_approved) return res.status(403).json({ message: "Tu cuenta está pendiente de aprobación." });
 
-        const payload = { userId: user.id, role: user.role, email: user.email };
+        const payload = { userId: user.id, role: user.role, email: user.email, permissions: user.permissions || getDefaultPermissions(user.role) };
         const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1d' });
+        
+        // Devolvemos el usuario completo, incluyendo sus permisos
+        const userResponse = {
+            id: user.id,
+            email: user.email,
+            role: user.role,
+            permissions: user.permissions || getDefaultPermissions(user.role) // Aseguramos que siempre haya permisos
+        };
 
-        res.json({ message: "Inicio de sesión exitoso", token, user: { id: user.id, email: user.email, role: user.role } });
+        res.json({ message: "Inicio de sesión exitoso", token, user: userResponse });
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: "Error interno del servidor." });
     }
 });
+
 
 // ===================================
 //  3.b ENDPOINTS DE USUARIOS (SOLO ADMIN)
@@ -349,25 +359,18 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
         res.status(500).json({ message: "Error interno del servidor al crear usuario." });
     }
 });
-
-// REEMPLAZA tu endpoint PUT /api/users/:id actual con este código corregido
 app.put('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
     const { id } = req.params;
     const { role, permissions } = req.body;
-
-    console.log('🔄 Actualizando usuario:', { id, role, permissions });
 
     if (!role) {
         return res.status(400).json({ message: 'El rol es requerido.' });
     }
     
     try {
-        // Usar los permisos enviados desde el frontend o los por defecto
         const finalPermissions = permissions || getDefaultPermissions(role);
         
-        console.log('📝 Permisos finales a aplicar:', finalPermissions);
-        
-        // Query más simple y confiable
+        // CORRECCIÓN CLAVE: No usamos JSON.stringify. El driver de pg maneja objetos JS directamente para columnas JSONB.
         const query = `
             UPDATE users 
             SET role = $1, permissions = $2, updated_at = CURRENT_TIMESTAMP
@@ -375,41 +378,34 @@ app.put('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
             RETURNING id, email, role, permissions, created_at, updated_at
         `;
         
-        const values = [role, JSON.stringify(finalPermissions), parseInt(id)];
-        
-        console.log('🔍 Ejecutando query con valores:', values);
+        const values = [role, finalPermissions, parseInt(id)];
         
         const result = await pool.query(query, values);
         
         if (result.rowCount === 0) {
-            console.log('❌ Usuario no encontrado o no activo con ID:', id);
-            return res.status(404).json({ message: "Usuario no encontrado" });
+            return res.status(404).json({ message: "Usuario no encontrado o no activo" });
         }
         
-        const updatedUser = result.rows[0];
-        console.log('✅ Usuario actualizado correctamente:', updatedUser);
-        
-        res.json(updatedUser);
+        res.json(result.rows[0]);
         
     } catch (error) {
         console.error('💥 Error actualizando usuario:', error);
-        res.status(500).json({ 
-            message: "Error al actualizar usuario",
-            error: process.env.NODE_ENV === 'development' ? error.message : 'Error interno'
-        });
+        res.status(500).json({ message: "Error al actualizar usuario" });
     }
 });
 // ===================================
 //  4. ENDPOINTS DE LA APLICACIÓN (LOTES Y VENTAS)
 // ===================================
 // Obtener todos los lotes con sus ventas
+// Obtener todos los lotes con sus ventas - MODIFICADO
 app.get('/api/batches', authenticateToken, async (req, res) => {
     try {
+        // Añadimos s.is_gift a la consulta
         const query = `
             SELECT
                 b.id as batch_id, b.bread_type, b.quantity_made, b.price, b.date, b.created_by,
                 u.email as created_by_email,
-                s.id as sale_id, s.person_name, s.quantity_sold, s.is_paid, s.is_delivered, s.created_at
+                s.id as sale_id, s.person_name, s.quantity_sold, s.is_paid, s.is_delivered, s.is_gift, s.created_at
             FROM bread_batches b
             LEFT JOIN sales s ON b.id = s.batch_id
             LEFT JOIN users u ON b.created_by = u.id
@@ -436,6 +432,7 @@ app.get('/api/batches', authenticateToken, async (req, res) => {
                     quantitySold: row.quantity_sold,
                     isPaid: row.is_paid,
                     isDelivered: row.is_delivered,
+                    isGift: row.is_gift, // Devolvemos el nuevo campo
                     createdAt: row.created_at
                 });
             }
@@ -500,16 +497,16 @@ app.delete('/api/batches/:batchId', authenticateToken, isAdmin, async (req, res)
         res.status(500).json({ message: "Error interno del servidor" });
     }
 });
-
-// Añadir una nueva venta a un lote
+// Añadir una nueva venta a un lote - MODIFICADO
 app.post('/api/batches/:batchId/sales', authenticateToken, async (req, res) => {
     const { batchId } = req.params;
-    const { personName, quantitySold } = req.body;
+    const { personName, quantitySold, isGift } = req.body; // Añadimos isGift
     const createdBy = req.user.userId;
     try {
+        // Añadimos is_gift a la inserción
         const { rows } = await pool.query(
-            'INSERT INTO sales (batch_id, person_name, quantity_sold, created_by) VALUES ($1, $2, $3, $4) RETURNING *',
-            [batchId, personName, quantitySold, createdBy]
+            'INSERT INTO sales (batch_id, person_name, quantity_sold, created_by, is_gift) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+            [batchId, personName, quantitySold, createdBy, !!isGift] // Usamos !!isGift para asegurar que sea booleano
         );
 
         const newSale = rows[0];
@@ -523,6 +520,7 @@ app.post('/api/batches/:batchId/sales', authenticateToken, async (req, res) => {
                 quantitySold: newSale.quantity_sold,
                 isPaid: newSale.is_paid,
                 isDelivered: newSale.is_delivered,
+                isGift: newSale.is_gift, // Notificamos el nuevo campo
                 createdAt: newSale.created_at
             }
         });
