@@ -737,21 +737,26 @@ app.patch('/api/batches/:batchId/date', authenticateToken, isAdmin, async (req, 
     }
     try {
         const { rows } = await pool.query(
-            'UPDATE bread_batches SET date = $1 WHERE id = $2 RETURNING *',
+            'UPDATE bread_batches SET date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *',
             [date, batchId]
         );
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Lote no encontrado.' });
         }
-        // Emitir un evento para que los clientes actualicen los datos
-        io.emit('batch:updated', { batchId: parseInt(batchId) });
+        
+        // Emitir un evento para que los clientes actualicen los datos del lote específico
+        // Es más eficiente que recargar todo
+        io.emit('batch:updated', { 
+            batchId: parseInt(batchId),
+            updatedData: { date: rows[0].date } 
+        });
+
         res.json(rows[0]);
     } catch (error) {
         console.error('Error updating batch date:', error);
         res.status(500).json({ message: "Error interno del servidor" });
     }
 });
-
 // ===================================
 //  5. GESTIÓN DE CONEXIONES SOCKET.IO
 // ===================================
