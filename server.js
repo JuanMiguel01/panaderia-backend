@@ -66,6 +66,13 @@ const validate = {
   positiveInt: (n) => Number.isInteger(Number(n)) && Number(n) > 0,
   positiveNum: (n) => !isNaN(Number(n)) && Number(n) >= 0,
   string: (s, maxLen = 200) => typeof s === 'string' && s.trim().length > 0 && s.length <= maxLen,
+  date: (d) => {
+    if (!d) return false;
+    // Aceptar formato YYYY-MM-DD
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    if (!re.test(d)) return false;
+    return !isNaN(Date.parse(d));
+  },
 };
 
 function bad(res, msg, status = 400) {
@@ -275,21 +282,47 @@ app.get('/api/batches', authenticateToken, async (req, res) => {
   res.json(Object.values(batches));
 });
 
+// ── CAMBIO: acepta campo opcional "date" ──────────────────
 app.post('/api/batches', authenticateToken, async (req, res) => {
-  const { breadType, quantityMade, price } = req.body;
-  if (!validate.string(breadType))     return bad(res, 'Tipo de pan inválido.');
+  const { breadType, quantityMade, price, date } = req.body;
+
+  if (!validate.string(breadType))         return bad(res, 'Tipo de pan inválido.');
   if (!validate.positiveInt(quantityMade)) return bad(res, 'Cantidad inválida.');
-  if (!validate.positiveNum(price))    return bad(res, 'Precio inválido.');
+  if (!validate.positiveNum(price))        return bad(res, 'Precio inválido.');
 
-  const { rows } = await pool.query(`
-    WITH nb AS (INSERT INTO bread_batches (bread_type,quantity_made,price,created_by) VALUES ($1,$2,$3,$4) RETURNING *)
-    SELECT nb.*, u.email AS created_by_email FROM nb JOIN users u ON nb.created_by=u.id
-  `, [breadType.trim(), quantityMade, price, req.user.userId]);
+  // Si se mandó fecha, validarla; si no se mandó, la BD usa DEFAULT CURRENT_DATE
+  const usarFecha = date !== undefined && date !== null && date !== '';
+  if (usarFecha && !validate.date(date)) return bad(res, 'La fecha proporcionada no es válida (usa formato YYYY-MM-DD).');
 
-  const b = rows[0];
-  const batch = { id:b.id, breadType:b.bread_type, quantityMade:b.quantity_made, price:b.price, date:b.date, createdBy:b.created_by_email, sales:[] };
-  io.emit('batch:created', batch);
-  res.status(201).json(batch);
+  try {
+    const query = usarFecha
+      ? `WITH nb AS (
+           INSERT INTO bread_batches (bread_type, quantity_made, price, created_by, date)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *
+         )
+         SELECT nb.*, u.email AS created_by_email FROM nb JOIN users u ON nb.created_by=u.id`
+      : `WITH nb AS (
+           INSERT INTO bread_batches (bread_type, quantity_made, price, created_by)
+           VALUES ($1, $2, $3, $4) RETURNING *
+         )
+         SELECT nb.*, u.email AS created_by_email FROM nb JOIN users u ON nb.created_by=u.id`;
+
+    const params = usarFecha
+      ? [breadType.trim(), Number(quantityMade), Number(price), req.user.userId, date]
+      : [breadType.trim(), Number(quantityMade), Number(price), req.user.userId];
+
+    const { rows } = await pool.query(query, params);
+    const b = rows[0];
+    const batch = {
+      id: b.id, breadType: b.bread_type, quantityMade: b.quantity_made,
+      price: b.price, date: b.date, createdBy: b.created_by_email, sales: []
+    };
+    io.emit('batch:created', batch);
+    res.status(201).json(batch);
+  } catch (err) {
+    console.error('Create batch error:', err);
+    res.status(500).json({ message: 'Error interno al crear el lote.' });
+  }
 });
 
 app.delete('/api/batches/:batchId', authenticateToken, isAdmin, async (req, res) => {
@@ -303,7 +336,8 @@ app.delete('/api/batches/:batchId', authenticateToken, isAdmin, async (req, res)
 app.patch('/api/batches/:batchId/date', authenticateToken, isAdmin, async (req, res) => {
   const id = parseInt(req.params.batchId);
   const { date } = req.body;
-  if (isNaN(id) || !date) return bad(res, 'Datos inválidos');
+  if (isNaN(id))            return bad(res, 'ID inválido');
+  if (!validate.date(date)) return bad(res, 'Fecha inválida.');
   const { rows, rowCount } = await pool.query(
     'UPDATE bread_batches SET date=$1,updated_at=CURRENT_TIMESTAMP WHERE id=$2 RETURNING *', [date, id]
   );
@@ -318,9 +352,9 @@ app.patch('/api/batches/:batchId/date', authenticateToken, isAdmin, async (req, 
 app.post('/api/batches/:batchId/sales', authenticateToken, async (req, res) => {
   const batchId = parseInt(req.params.batchId);
   const { personName, quantitySold, isGift } = req.body;
-  if (isNaN(batchId))                       return bad(res, 'Batch ID inválido');
-  if (!validate.string(personName, 100))    return bad(res, 'Nombre inválido.');
-  if (!validate.positiveInt(quantitySold))  return bad(res, 'Cantidad inválida.');
+  if (isNaN(batchId))                      return bad(res, 'Batch ID inválido');
+  if (!validate.string(personName, 100))   return bad(res, 'Nombre inválido.');
+  if (!validate.positiveInt(quantitySold)) return bad(res, 'Cantidad inválida.');
 
   const { rows } = await pool.query(
     'INSERT INTO sales (batch_id,person_name,quantity_sold,created_by,is_gift) VALUES ($1,$2,$3,$4,$5) RETURNING *',
@@ -340,7 +374,7 @@ app.patch('/api/batches/:batchId/sales/:saleId', authenticateToken, async (req, 
 
   const fields = [], values = [];
   let i = 1;
-  if (typeof isPaid !== 'undefined')     { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
+  if (typeof isPaid !== 'undefined')      { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
   if (typeof isDelivered !== 'undefined') { fields.push(`is_delivered=$${i++}`); values.push(isDelivered); }
   if (!fields.length) return bad(res, 'Sin campos para actualizar.');
 
@@ -370,9 +404,9 @@ app.get('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
 
 app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
   const { name, quantity, unit } = req.body;
-  if (!validate.string(name, 100))   return bad(res, 'Nombre inválido.');
+  if (!validate.string(name, 100))     return bad(res, 'Nombre inválido.');
   if (!validate.positiveNum(quantity)) return bad(res, 'Cantidad inválida.');
-  if (!validate.string(unit, 20))    return bad(res, 'Unidad inválida.');
+  if (!validate.string(unit, 20))      return bad(res, 'Unidad inválida.');
   try {
     const { rows } = await pool.query(
       'INSERT INTO inventory_items (name,quantity,unit) VALUES ($1,$2,$3) RETURNING *',
