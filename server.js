@@ -1,4 +1,4 @@
-// server.js — Versión mejorada con seguridad, validación y manejo de errores
+// server.js — Versión con presets de pan y mejoras
 
 require('dotenv').config();
 const express  = require('express');
@@ -25,6 +25,48 @@ const pool = new Pool({
 
 pool.on('error', (err) => console.error('Unexpected DB error', err));
 
+// ── Auto-create bread_presets table + seed defaults ───────
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bread_presets (
+      id         SERIAL PRIMARY KEY,
+      name       VARCHAR(100) NOT NULL UNIQUE,
+      price      DECIMAL(10,2) NOT NULL,
+      emoji      VARCHAR(10) DEFAULT '🍞',
+      is_active  BOOLEAN DEFAULT TRUE,
+      sort_order INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Seed default presets only if table is empty
+  const { rows } = await pool.query('SELECT COUNT(*) FROM bread_presets');
+  if (parseInt(rows[0].count) === 0) {
+    const defaults = [
+      { name: 'Pan Bola',        price: 200, emoji: '🫓', sort: 1 },
+      { name: 'Pan Perro',       price: 200, emoji: '🌭', sort: 2 },
+      { name: 'Hamburguesa',     price: 285, emoji: '🍔', sort: 3 },
+      { name: 'Tostadas',        price: 130, emoji: '🍞', sort: 4 },
+      { name: 'Pan Bola 90g',    price: 350, emoji: '🫓', sort: 5 },
+      { name: 'Base de Pizzas',  price: 290, emoji: '🍕', sort: 6 },
+      { name: 'Pan Perro Chico', price: 120, emoji: '🌭', sort: 7 },
+      { name: 'Pan Molde',       price: 310, emoji: '🍞', sort: 8 },
+      { name: 'Pan Hambur',      price: 290, emoji: '🍔', sort: 9 },
+      { name: 'Pan Flauta',      price: 140, emoji: '🥖', sort: 10 },
+    ];
+    for (const d of defaults) {
+      await pool.query(
+        'INSERT INTO bread_presets (name, price, emoji, sort_order) VALUES ($1, $2, $3, $4)',
+        [d.name, d.price, d.emoji, d.sort]
+      );
+    }
+    console.log('✅ Presets de pan sembrados por defecto');
+  }
+}
+
+initDB().catch(err => console.error('initDB error:', err));
+
 // ===================================
 //  HTTP + Socket.IO
 // ===================================
@@ -35,7 +77,7 @@ const FRONTEND_URL = process.env.NODE_ENV === 'production'
   : 'http://localhost:5173';
 
 const io = new Server(server, {
-  cors: { origin: FRONTEND_URL, methods: ['GET','POST','PATCH','DELETE'], credentials: true },
+  cors: { origin: FRONTEND_URL, methods: ['GET','POST','PATCH','DELETE','PUT'], credentials: true },
   pingTimeout: 60000,
 });
 
@@ -45,7 +87,6 @@ const io = new Server(server, {
 app.use(express.json({ limit: '10mb' }));
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 
-// Security headers
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -53,7 +94,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Request logger (only non-production)
 if (process.env.NODE_ENV !== 'production') {
   app.use((req, _, next) => { console.log(`${req.method} ${req.path}`); next(); });
 }
@@ -62,22 +102,18 @@ if (process.env.NODE_ENV !== 'production') {
 //  VALIDATION HELPERS
 // ===================================
 const validate = {
-  email: (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e),
+  email:       (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e),
   positiveInt: (n) => Number.isInteger(Number(n)) && Number(n) > 0,
   positiveNum: (n) => !isNaN(Number(n)) && Number(n) >= 0,
-  string: (s, maxLen = 200) => typeof s === 'string' && s.trim().length > 0 && s.length <= maxLen,
+  string:      (s, maxLen = 200) => typeof s === 'string' && s.trim().length > 0 && s.length <= maxLen,
   date: (d) => {
     if (!d) return false;
-    // Aceptar formato YYYY-MM-DD
-    const re = /^\d{4}-\d{2}-\d{2}$/;
-    if (!re.test(d)) return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return false;
     return !isNaN(Date.parse(d));
   },
 };
 
-function bad(res, msg, status = 400) {
-  return res.status(status).json({ message: msg });
-}
+function bad(res, msg, status = 400) { return res.status(status).json({ message: msg }); }
 
 // ===================================
 //  AUTH MIDDLEWARE
@@ -85,12 +121,8 @@ function bad(res, msg, status = 400) {
 function authenticateToken(req, res, next) {
   const token = req.headers['authorization']?.split(' ')[1];
   if (!token) return res.sendStatus(401);
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    return res.sendStatus(403);
-  }
+  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
+  catch { return res.sendStatus(403); }
 }
 
 function isAdmin(req, res, next) {
@@ -101,7 +133,7 @@ function isAdmin(req, res, next) {
 
 function getDefaultPermissions(role) {
   switch (role) {
-    case 'admin':   return { canViewStockCard:true,  canManageStock:true,  canViewAllSales:true,  canDeleteSales:true };
+    case 'admin':   return { canViewStockCard:true,  canManageStock:true,  canViewAllSales:true,  canDeleteSales:true  };
     case 'manager': return { canViewStockCard:true,  canManageStock:true,  canViewAllSales:true,  canDeleteSales:false };
     default:        return { canViewStockCard:false, canManageStock:false, canViewAllSales:false, canDeleteSales:false };
   }
@@ -119,7 +151,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.get('/', (_, res) => res.json({ message: 'Panadería API v2.0 ✓', docs: '/health' }));
+app.get('/', (_, res) => res.json({ message: 'Panadería API v2.1 ✓', docs: '/health' }));
 
 // ===================================
 //  AUTH ENDPOINTS
@@ -129,7 +161,6 @@ app.post('/api/auth/register', async (req, res) => {
   if (!validate.email(email))         return bad(res, 'Email inválido.');
   if (!validate.string(password, 72)) return bad(res, 'Contraseña inválida (máx 72 chars).');
   if (password.length < 6)            return bad(res, 'La contraseña debe tener al menos 6 caracteres.');
-
   try {
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
@@ -148,7 +179,6 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return bad(res, 'Email y contraseña son requeridos.');
-
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email.toLowerCase().trim()]);
     const user = rows[0];
@@ -156,16 +186,10 @@ app.post('/api/auth/login', async (req, res) => {
       return bad(res, 'Credenciales inválidas.', 401);
     if (!user.is_approved)
       return bad(res, 'Tu cuenta está pendiente de aprobación.', 403);
-
     const permissions = user.permissions || getDefaultPermissions(user.role);
     const payload = { userId: user.id, role: user.role, email: user.email, permissions };
     const token   = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' });
-
-    res.json({
-      message: 'Inicio de sesión exitoso',
-      token,
-      user: { id: user.id, email: user.email, role: user.role, permissions }
-    });
+    res.json({ message: 'Inicio de sesión exitoso', token, user: { id: user.id, email: user.email, role: user.role, permissions } });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ message: 'Error interno.' });
@@ -176,17 +200,13 @@ app.post('/api/auth/login', async (req, res) => {
 //  USERS (ADMIN)
 // ===================================
 app.get('/api/users/pending', authenticateToken, isAdmin, async (req, res) => {
-  const { rows } = await pool.query(
-    'SELECT id,email,role,created_at FROM users WHERE is_approved=FALSE ORDER BY created_at DESC'
-  );
+  const { rows } = await pool.query('SELECT id,email,role,created_at FROM users WHERE is_approved=FALSE ORDER BY created_at DESC');
   res.json(rows);
 });
 
 app.get('/api/users/active', authenticateToken, isAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      'SELECT id,email,role,permissions,created_at FROM users WHERE is_approved=TRUE ORDER BY created_at DESC'
-    );
+    const { rows } = await pool.query('SELECT id,email,role,permissions,created_at FROM users WHERE is_approved=TRUE ORDER BY created_at DESC');
     res.json(rows.map(u => ({ ...u, permissions: u.permissions || getDefaultPermissions(u.role) })));
   } catch {
     const { rows } = await pool.query('SELECT id,email,role,created_at FROM users WHERE is_approved=TRUE ORDER BY created_at DESC');
@@ -197,9 +217,7 @@ app.get('/api/users/active', authenticateToken, isAdmin, async (req, res) => {
 app.patch('/api/users/:id/approve', authenticateToken, isAdmin, async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) return bad(res, 'ID inválido');
-  const { rows, rowCount } = await pool.query(
-    'UPDATE users SET is_approved=TRUE WHERE id=$1 AND is_approved=FALSE RETURNING id,email,role', [id]
-  );
+  const { rows, rowCount } = await pool.query('UPDATE users SET is_approved=TRUE WHERE id=$1 AND is_approved=FALSE RETURNING id,email,role', [id]);
   if (rowCount === 0) return bad(res, 'Usuario no encontrado o ya aprobado.', 404);
   io.emit('user:approved', rows[0]);
   res.json({ message: 'Usuario aprobado.', user: rows[0] });
@@ -216,12 +234,11 @@ app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
 
 app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
   const { email, password, role, permissions } = req.body;
-  if (!validate.email(email))                         return bad(res, 'Email inválido.');
+  if (!validate.email(email))                          return bad(res, 'Email inválido.');
   if (!validate.string(password, 72) || password.length < 6) return bad(res, 'Contraseña inválida (mín. 6 chars).');
-  if (!['admin','manager','employee'].includes(role)) return bad(res, 'Rol inválido.');
-
+  if (!['admin','manager','employee'].includes(role))  return bad(res, 'Rol inválido.');
   try {
-    const hash = await bcrypt.hash(password, 12);
+    const hash  = await bcrypt.hash(password, 12);
     const perms = permissions || getDefaultPermissions(role);
     const { rows } = await pool.query(
       'INSERT INTO users (email,password_hash,role,permissions,is_approved) VALUES ($1,$2,$3,$4,TRUE) RETURNING id,email,role,permissions,created_at',
@@ -282,41 +299,25 @@ app.get('/api/batches', authenticateToken, async (req, res) => {
   res.json(Object.values(batches));
 });
 
-// ── CAMBIO: acepta campo opcional "date" ──────────────────
 app.post('/api/batches', authenticateToken, async (req, res) => {
   const { breadType, quantityMade, price, date } = req.body;
-
   if (!validate.string(breadType))         return bad(res, 'Tipo de pan inválido.');
   if (!validate.positiveInt(quantityMade)) return bad(res, 'Cantidad inválida.');
   if (!validate.positiveNum(price))        return bad(res, 'Precio inválido.');
-
-  // Si se mandó fecha, validarla; si no se mandó, la BD usa DEFAULT CURRENT_DATE
   const usarFecha = date !== undefined && date !== null && date !== '';
-  if (usarFecha && !validate.date(date)) return bad(res, 'La fecha proporcionada no es válida (usa formato YYYY-MM-DD).');
-
+  if (usarFecha && !validate.date(date))   return bad(res, 'La fecha proporcionada no es válida (usa formato YYYY-MM-DD).');
   try {
     const query = usarFecha
-      ? `WITH nb AS (
-           INSERT INTO bread_batches (bread_type, quantity_made, price, created_by, date)
-           VALUES ($1, $2, $3, $4, $5) RETURNING *
-         )
+      ? `WITH nb AS (INSERT INTO bread_batches (bread_type,quantity_made,price,created_by,date) VALUES ($1,$2,$3,$4,$5) RETURNING *)
          SELECT nb.*, u.email AS created_by_email FROM nb JOIN users u ON nb.created_by=u.id`
-      : `WITH nb AS (
-           INSERT INTO bread_batches (bread_type, quantity_made, price, created_by)
-           VALUES ($1, $2, $3, $4) RETURNING *
-         )
+      : `WITH nb AS (INSERT INTO bread_batches (bread_type,quantity_made,price,created_by) VALUES ($1,$2,$3,$4) RETURNING *)
          SELECT nb.*, u.email AS created_by_email FROM nb JOIN users u ON nb.created_by=u.id`;
-
     const params = usarFecha
       ? [breadType.trim(), Number(quantityMade), Number(price), req.user.userId, date]
       : [breadType.trim(), Number(quantityMade), Number(price), req.user.userId];
-
     const { rows } = await pool.query(query, params);
     const b = rows[0];
-    const batch = {
-      id: b.id, breadType: b.bread_type, quantityMade: b.quantity_made,
-      price: b.price, date: b.date, createdBy: b.created_by_email, sales: []
-    };
+    const batch = { id: b.id, breadType: b.bread_type, quantityMade: b.quantity_made, price: b.price, date: b.date, createdBy: b.created_by_email, sales: [] };
     io.emit('batch:created', batch);
     res.status(201).json(batch);
   } catch (err) {
@@ -338,9 +339,7 @@ app.patch('/api/batches/:batchId/date', authenticateToken, isAdmin, async (req, 
   const { date } = req.body;
   if (isNaN(id))            return bad(res, 'ID inválido');
   if (!validate.date(date)) return bad(res, 'Fecha inválida.');
-  const { rows, rowCount } = await pool.query(
-    'UPDATE bread_batches SET date=$1,updated_at=CURRENT_TIMESTAMP WHERE id=$2 RETURNING *', [date, id]
-  );
+  const { rows, rowCount } = await pool.query('UPDATE bread_batches SET date=$1,updated_at=CURRENT_TIMESTAMP WHERE id=$2 RETURNING *', [date, id]);
   if (rowCount === 0) return bad(res, 'Lote no encontrado.', 404);
   io.emit('batch:updated', { batchId: id, updatedData: { date: rows[0].date } });
   res.json(rows[0]);
@@ -355,6 +354,14 @@ app.post('/api/batches/:batchId/sales', authenticateToken, async (req, res) => {
   if (isNaN(batchId))                      return bad(res, 'Batch ID inválido');
   if (!validate.string(personName, 100))   return bad(res, 'Nombre inválido.');
   if (!validate.positiveInt(quantitySold)) return bad(res, 'Cantidad inválida.');
+
+  // Server-side stock validation
+  const { rows: batchRows } = await pool.query('SELECT quantity_made FROM bread_batches WHERE id=$1', [batchId]);
+  if (!batchRows[0]) return bad(res, 'Lote no encontrado.', 404);
+  const { rows: soldRows } = await pool.query('SELECT COALESCE(SUM(quantity_sold),0) AS total FROM sales WHERE batch_id=$1', [batchId]);
+  const remaining = batchRows[0].quantity_made - parseInt(soldRows[0].total);
+  if (quantitySold > remaining)
+    return bad(res, `Solo quedan ${remaining} unidades disponibles en este lote.`);
 
   const { rows } = await pool.query(
     'INSERT INTO sales (batch_id,person_name,quantity_sold,created_by,is_gift) VALUES ($1,$2,$3,$4,$5) RETURNING *',
@@ -371,13 +378,11 @@ app.patch('/api/batches/:batchId/sales/:saleId', authenticateToken, async (req, 
   if (isNaN(saleId)) return bad(res, 'Sale ID inválido');
   if (typeof isPaid !== 'undefined' && req.user.role !== 'admin')
     return bad(res, 'Solo administradores pueden cambiar el estado de pago.', 403);
-
   const fields = [], values = [];
   let i = 1;
-  if (typeof isPaid !== 'undefined')      { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
+  if (typeof isPaid      !== 'undefined') { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
   if (typeof isDelivered !== 'undefined') { fields.push(`is_delivered=$${i++}`); values.push(isDelivered); }
   if (!fields.length) return bad(res, 'Sin campos para actualizar.');
-
   values.push(saleId);
   const { rows } = await pool.query(`UPDATE sales SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, values);
   const s = rows[0];
@@ -395,6 +400,64 @@ app.delete('/api/batches/:batchId/sales/:saleId', authenticateToken, isAdmin, as
 });
 
 // ===================================
+//  BREAD PRESETS
+// ===================================
+// GET — any authenticated user (used in batch form)
+app.get('/api/presets', authenticateToken, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM bread_presets WHERE is_active=TRUE ORDER BY sort_order ASC, name ASC');
+  res.json(rows);
+});
+
+// POST — admin only
+app.post('/api/presets', authenticateToken, isAdmin, async (req, res) => {
+  const { name, price, emoji } = req.body;
+  if (!validate.string(name, 100))     return bad(res, 'Nombre inválido.');
+  if (!validate.positiveNum(price) || Number(price) === 0) return bad(res, 'Precio inválido.');
+  const safeEmoji = (typeof emoji === 'string' && emoji.trim()) ? emoji.trim() : '🍞';
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO bread_presets (name, price, emoji) VALUES ($1, $2, $3) RETURNING *',
+      [name.trim(), Number(price), safeEmoji]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return bad(res, 'Ya existe un preset con ese nombre.');
+    console.error('Create preset error:', err);
+    res.status(500).json({ message: 'Error interno.' });
+  }
+});
+
+// PUT — admin only
+app.put('/api/presets/:id', authenticateToken, isAdmin, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return bad(res, 'ID inválido');
+  const { name, price, emoji } = req.body;
+  if (!validate.string(name, 100))     return bad(res, 'Nombre inválido.');
+  if (!validate.positiveNum(price) || Number(price) === 0) return bad(res, 'Precio inválido.');
+  const safeEmoji = (typeof emoji === 'string' && emoji.trim()) ? emoji.trim() : '🍞';
+  try {
+    const { rows, rowCount } = await pool.query(
+      'UPDATE bread_presets SET name=$1, price=$2, emoji=$3, updated_at=CURRENT_TIMESTAMP WHERE id=$4 RETURNING *',
+      [name.trim(), Number(price), safeEmoji, id]
+    );
+    if (rowCount === 0) return bad(res, 'Preset no encontrado.', 404);
+    res.json(rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return bad(res, 'Ya existe un preset con ese nombre.');
+    res.status(500).json({ message: 'Error interno.' });
+  }
+});
+
+// DELETE — admin only
+app.delete('/api/presets/:id', authenticateToken, isAdmin, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return bad(res, 'ID inválido');
+  const { rowCount } = await pool.query('DELETE FROM bread_presets WHERE id=$1', [id]);
+  if (rowCount === 0) return bad(res, 'Preset no encontrado.', 404);
+  res.status(204).send();
+});
+
+// ===================================
 //  INVENTORY
 // ===================================
 app.get('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
@@ -408,10 +471,7 @@ app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
   if (!validate.positiveNum(quantity)) return bad(res, 'Cantidad inválida.');
   if (!validate.string(unit, 20))      return bad(res, 'Unidad inválida.');
   try {
-    const { rows } = await pool.query(
-      'INSERT INTO inventory_items (name,quantity,unit) VALUES ($1,$2,$3) RETURNING *',
-      [name.trim(), Number(quantity), unit.trim()]
-    );
+    const { rows } = await pool.query('INSERT INTO inventory_items (name,quantity,unit) VALUES ($1,$2,$3) RETURNING *', [name.trim(), Number(quantity), unit.trim()]);
     res.status(201).json(rows[0]);
   } catch (err) {
     if (err.code === '23505') return bad(res, 'El insumo ya existe.');
@@ -422,19 +482,14 @@ app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
 app.patch('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) => {
   const id = parseInt(req.params.id), change = Number(req.body.change);
   if (isNaN(id) || isNaN(change) || change === 0) return bad(res, 'Datos inválidos.');
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { rows: [item] } = await client.query('SELECT quantity FROM inventory_items WHERE id=$1 FOR UPDATE', [id]);
     if (!item) { await client.query('ROLLBACK'); return bad(res, 'Insumo no encontrado.', 404); }
-
     const after = Number(item.quantity) + change;
     const { rows: [updated] } = await client.query('UPDATE inventory_items SET quantity=$1 WHERE id=$2 RETURNING *', [after, id]);
-    await client.query(
-      'INSERT INTO inventory_logs (item_id,user_id,change_amount,quantity_before,quantity_after) VALUES ($1,$2,$3,$4,$5)',
-      [id, req.user.userId, change, item.quantity, after]
-    );
+    await client.query('INSERT INTO inventory_logs (item_id,user_id,change_amount,quantity_before,quantity_after) VALUES ($1,$2,$3,$4,$5)', [id, req.user.userId, change, item.quantity, after]);
     await client.query('COMMIT');
     res.json(updated);
   } catch (err) {
@@ -475,9 +530,7 @@ io.on('connection', socket => {
 // ===================================
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err.stack);
-  res.status(500).json({
-    message: process.env.NODE_ENV === 'production' ? 'Error interno del servidor.' : err.message
-  });
+  res.status(500).json({ message: process.env.NODE_ENV === 'production' ? 'Error interno del servidor.' : err.message });
 });
 
 app.use('*', (req, res) => res.status(404).json({ message: `Ruta '${req.originalUrl}' no encontrada.` }));
@@ -486,7 +539,7 @@ app.use('*', (req, res) => res.status(404).json({ message: `Ruta '${req.original
 //  START
 // ===================================
 server.listen(port, '0.0.0.0', () => {
-  console.log(`\n🚀 Panadería Backend v2.0`);
+  console.log(`\n🚀 Panadería Backend v2.1`);
   console.log(`   Puerto: ${port}`);
   console.log(`   Entorno: ${process.env.NODE_ENV || 'development'}`);
   console.log(`   Frontend: ${FRONTEND_URL}\n`);
