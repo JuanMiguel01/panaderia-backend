@@ -68,6 +68,7 @@ async function initDB() {
   await pool.query(`ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(10,2) DEFAULT 0`);
   await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(10,2) DEFAULT 0`);
   await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS log_type  VARCHAR(20) DEFAULT 'adjust'`);
+  await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS log_date   DATE DEFAULT CURRENT_DATE`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cuadre_gastos (
@@ -546,6 +547,7 @@ app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
 app.patch('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) => {
   const id = parseInt(req.params.id), change = Number(req.body.change);
   const purchaseCost = req.body.unit_cost !== undefined ? Number(req.body.unit_cost) : null;
+  const logDate      = req.body.log_date && validate.date(req.body.log_date) ? req.body.log_date : null;
   if (isNaN(id) || isNaN(change) || change === 0) return bad(res, 'Datos inválidos.');
   if (purchaseCost !== null && (isNaN(purchaseCost) || purchaseCost < 0)) return bad(res, 'Costo unitario inválido.');
   const client = await pool.connect();
@@ -571,8 +573,8 @@ app.patch('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) => 
       [after, newUnitCost, id]
     );
     await client.query(
-      'INSERT INTO inventory_logs (item_id,user_id,change_amount,quantity_before,quantity_after,unit_cost,log_type) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [id, req.user.userId, change, item.quantity, after, logUnitCost, logType]
+      'INSERT INTO inventory_logs (item_id,user_id,change_amount,quantity_before,quantity_after,unit_cost,log_type,log_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [id, req.user.userId, change, item.quantity, after, logUnitCost, logType, logDate || new Date().toISOString().split('T')[0]]
     );
     await client.query('COMMIT');
     res.json(updated);
@@ -625,13 +627,13 @@ app.get('/api/inventory/daily/:date', authenticateToken, isAdmin, async (req, re
         SUM(CASE WHEN l.change_amount > 0 THEN l.change_amount ELSE 0 END)       AS entrada,
         ABS(SUM(CASE WHEN l.change_amount < 0 THEN l.change_amount ELSE 0 END))  AS salida,
         (SELECT l2.quantity_before FROM inventory_logs l2
-         WHERE l2.item_id = l.item_id AND DATE(l2.created_at) = $1
+         WHERE l2.item_id = l.item_id AND l2.log_date = $1
          ORDER BY l2.created_at ASC  LIMIT 1) AS inicio,
         (SELECT l2.quantity_after  FROM inventory_logs l2
-         WHERE l2.item_id = l.item_id AND DATE(l2.created_at) = $1
+         WHERE l2.item_id = l.item_id AND l2.log_date = $1
          ORDER BY l2.created_at DESC LIMIT 1) AS final_qty
       FROM inventory_logs l
-      WHERE DATE(l.created_at) = $1
+      WHERE l.log_date = $1
       GROUP BY l.item_id
     ) d ON i.id = d.item_id
     ORDER BY i.name ASC
@@ -713,7 +715,7 @@ app.post('/api/fondos/cierre/:date', authenticateToken, isAdmin, async (req, res
     const { rows: [cRow] } = await client.query(`
       SELECT COALESCE(SUM(ABS(l.change_amount) * l.unit_cost), 0) AS total
       FROM inventory_logs l
-      WHERE DATE(l.created_at) = $1 AND l.change_amount < 0
+      WHERE l.log_date = $1 AND l.change_amount < 0
     `, [date]);
     const totalCostoInsumos = Number(cRow.total);
 
