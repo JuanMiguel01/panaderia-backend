@@ -63,6 +63,65 @@ async function initDB() {
     }
     console.log('✅ Presets de pan sembrados por defecto');
   }
+
+  // ── Financial schema migrations (safe: IF NOT EXISTS / ADD COLUMN IF NOT EXISTS) ──
+  await pool.query(`ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(10,2) DEFAULT 0`);
+  await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(10,2) DEFAULT 0`);
+  await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS log_type  VARCHAR(20) DEFAULT 'adjust'`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cuadre_gastos (
+      id         SERIAL PRIMARY KEY,
+      date       DATE NOT NULL,
+      category   VARCHAR(20) NOT NULL,
+      concepto   VARCHAR(200) NOT NULL DEFAULT '',
+      monto      DECIMAL(10,2) NOT NULL DEFAULT 0,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_funds (
+      id         SERIAL PRIMARY KEY,
+      persona    VARCHAR(20) NOT NULL UNIQUE,
+      saldo      DECIMAL(10,2) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  const { rows: pfRows } = await pool.query('SELECT COUNT(*) FROM partner_funds');
+  if (parseInt(pfRows[0].count) === 0) {
+    for (const p of ['jm', 'michel', 'nadiel'])
+      await pool.query('INSERT INTO partner_funds (persona) VALUES ($1)', [p]);
+    console.log('✅ Fondos de socios creados');
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_fund_movements (
+      id                  SERIAL PRIMARY KEY,
+      date                DATE NOT NULL,
+      persona             VARCHAR(20) NOT NULL,
+      ventas_parte        DECIMAL(10,2) NOT NULL DEFAULT 0,
+      gastos_individuales DECIMAL(10,2) NOT NULL DEFAULT 0,
+      utilidad_final      DECIMAL(10,2) NOT NULL DEFAULT 0,
+      created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(date, persona)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS debts (
+      id         SERIAL PRIMARY KEY,
+      tipo       VARCHAR(10) NOT NULL CHECK (tipo IN ('cobrar','pagar')),
+      concepto   VARCHAR(200) NOT NULL,
+      persona    VARCHAR(100) DEFAULT '',
+      monto      DECIMAL(10,2) NOT NULL DEFAULT 0,
+      is_paid    BOOLEAN DEFAULT FALSE,
+      date       DATE DEFAULT CURRENT_DATE,
+      notes      VARCHAR(500) DEFAULT '',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 }
 
 initDB().catch(err => console.error('initDB error:', err));
@@ -481,15 +540,35 @@ app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
 
 app.patch('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) => {
   const id = parseInt(req.params.id), change = Number(req.body.change);
+  const purchaseCost = req.body.unit_cost !== undefined ? Number(req.body.unit_cost) : null;
   if (isNaN(id) || isNaN(change) || change === 0) return bad(res, 'Datos inválidos.');
+  if (purchaseCost !== null && (isNaN(purchaseCost) || purchaseCost < 0)) return bad(res, 'Costo unitario inválido.');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows: [item] } = await client.query('SELECT quantity FROM inventory_items WHERE id=$1 FOR UPDATE', [id]);
+    const { rows: [item] } = await client.query('SELECT quantity, unit_cost FROM inventory_items WHERE id=$1 FOR UPDATE', [id]);
     if (!item) { await client.query('ROLLBACK'); return bad(res, 'Insumo no encontrado.', 404); }
-    const after = Number(item.quantity) + change;
-    const { rows: [updated] } = await client.query('UPDATE inventory_items SET quantity=$1 WHERE id=$2 RETURNING *', [after, id]);
-    await client.query('INSERT INTO inventory_logs (item_id,user_id,change_amount,quantity_before,quantity_after) VALUES ($1,$2,$3,$4,$5)', [id, req.user.userId, change, item.quantity, after]);
+    const after     = Number(item.quantity) + change;
+    const currCost  = Number(item.unit_cost) || 0;
+    const currQty   = Number(item.quantity);
+    // Weighted-average cost: only recalculate on purchase with explicit cost
+    let newUnitCost = currCost;
+    let logUnitCost = currCost;
+    if (change > 0 && purchaseCost !== null) {
+      newUnitCost = currQty <= 0
+        ? purchaseCost
+        : (currQty * currCost + change * purchaseCost) / (currQty + change);
+      logUnitCost = purchaseCost;
+    }
+    const logType = change > 0 ? 'purchase' : 'consume';
+    const { rows: [updated] } = await client.query(
+      'UPDATE inventory_items SET quantity=$1, unit_cost=$2 WHERE id=$3 RETURNING *',
+      [after, newUnitCost, id]
+    );
+    await client.query(
+      'INSERT INTO inventory_logs (item_id,user_id,change_amount,quantity_before,quantity_after,unit_cost,log_type) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [id, req.user.userId, change, item.quantity, after, logUnitCost, logType]
+    );
     await client.query('COMMIT');
     res.json(updated);
   } catch (err) {
@@ -514,6 +593,215 @@ app.delete('/api/inventory/:id', authenticateToken, isAdmin, async (req, res) =>
   if (isNaN(id)) return bad(res, 'ID inválido');
   const { rowCount } = await pool.query('DELETE FROM inventory_items WHERE id=$1', [id]);
   if (rowCount === 0) return bad(res, 'Insumo no encontrado.', 404);
+  res.status(204).send();
+});
+
+// ===================================
+//  INVENTORY — DAILY SUMMARY
+// ===================================
+// Must be before /:id routes to avoid 'daily' being parsed as an id
+app.get('/api/inventory/daily/:date', authenticateToken, isAdmin, async (req, res) => {
+  const { date } = req.params;
+  if (!validate.date(date)) return bad(res, 'Fecha inválida.');
+  const { rows } = await pool.query(`
+    SELECT
+      i.id, i.name, i.unit,
+      i.quantity   AS current_qty,
+      i.unit_cost,
+      COALESCE(d.entrada,   0)                       AS entrada,
+      COALESCE(d.salida,    0)                       AS salida,
+      COALESCE(d.inicio,    i.quantity)              AS inicio,
+      COALESCE(d.final_qty, i.quantity)              AS final_qty,
+      COALESCE(d.salida, 0) * i.unit_cost            AS costo_salida
+    FROM inventory_items i
+    LEFT JOIN (
+      SELECT
+        l.item_id,
+        SUM(CASE WHEN l.change_amount > 0 THEN l.change_amount ELSE 0 END)       AS entrada,
+        ABS(SUM(CASE WHEN l.change_amount < 0 THEN l.change_amount ELSE 0 END))  AS salida,
+        (SELECT l2.quantity_before FROM inventory_logs l2
+         WHERE l2.item_id = l.item_id AND DATE(l2.created_at) = $1
+         ORDER BY l2.created_at ASC  LIMIT 1) AS inicio,
+        (SELECT l2.quantity_after  FROM inventory_logs l2
+         WHERE l2.item_id = l.item_id AND DATE(l2.created_at) = $1
+         ORDER BY l2.created_at DESC LIMIT 1) AS final_qty
+      FROM inventory_logs l
+      WHERE DATE(l.created_at) = $1
+      GROUP BY l.item_id
+    ) d ON i.id = d.item_id
+    ORDER BY i.name ASC
+  `, [date]);
+  res.json(rows);
+});
+
+// ===================================
+//  GASTOS DEL CUADRE
+// ===================================
+app.get('/api/gastos/:date', authenticateToken, isAdmin, async (req, res) => {
+  const { date } = req.params;
+  if (!validate.date(date)) return bad(res, 'Fecha inválida.');
+  const { rows } = await pool.query(
+    'SELECT * FROM cuadre_gastos WHERE date=$1 ORDER BY category, created_at ASC', [date]
+  );
+  res.json(rows);
+});
+
+app.post('/api/gastos', authenticateToken, isAdmin, async (req, res) => {
+  const { date, category, concepto, monto } = req.body;
+  if (!validate.date(date)) return bad(res, 'Fecha inválida.');
+  if (!['generales','jm','michel','nadiel','fondo'].includes(category)) return bad(res, 'Categoría inválida.');
+  if (isNaN(Number(monto)) || Number(monto) < 0) return bad(res, 'Monto inválido.');
+  const { rows } = await pool.query(
+    'INSERT INTO cuadre_gastos (date,category,concepto,monto,created_by) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [date, category, (concepto || '').trim(), Number(monto), req.user.userId]
+  );
+  res.status(201).json(rows[0]);
+});
+
+app.delete('/api/gastos/:id', authenticateToken, isAdmin, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return bad(res, 'ID inválido');
+  const { rowCount } = await pool.query('DELETE FROM cuadre_gastos WHERE id=$1', [id]);
+  if (rowCount === 0) return bad(res, 'Gasto no encontrado.', 404);
+  res.status(204).send();
+});
+
+// ===================================
+//  FONDOS DE SOCIOS
+// ===================================
+app.get('/api/fondos', authenticateToken, isAdmin, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM partner_funds ORDER BY persona ASC');
+  res.json(rows);
+});
+
+// Manual adjustment of a partner's fund (e.g. to set initial balance)
+app.patch('/api/fondos/:persona', authenticateToken, isAdmin, async (req, res) => {
+  const { persona } = req.params;
+  if (!['jm','michel','nadiel'].includes(persona)) return bad(res, 'Persona inválida.');
+  const { saldo } = req.body;
+  if (isNaN(Number(saldo))) return bad(res, 'Saldo inválido.');
+  const { rows } = await pool.query(
+    'UPDATE partner_funds SET saldo=$1, updated_at=CURRENT_TIMESTAMP WHERE persona=$2 RETURNING *',
+    [Number(saldo), persona]
+  );
+  res.json(rows[0]);
+});
+
+// Daily closing: calculate and persist financial result for a date
+app.post('/api/fondos/cierre/:date', authenticateToken, isAdmin, async (req, res) => {
+  const { date } = req.params;
+  if (!validate.date(date)) return bad(res, 'Fecha inválida.');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Total ventas (excluding gifts)
+    const { rows: [vRow] } = await client.query(`
+      SELECT COALESCE(SUM(s.quantity_sold * b.price), 0) AS total
+      FROM bread_batches b
+      JOIN sales s ON b.id = s.batch_id
+      WHERE b.date = $1 AND s.is_gift = FALSE
+    `, [date]);
+    const totalVentas = Number(vRow.total);
+
+    // 2. Costo de insumos consumidos ese día (consume logs)
+    const { rows: [cRow] } = await client.query(`
+      SELECT COALESCE(SUM(ABS(l.change_amount) * l.unit_cost), 0) AS total
+      FROM inventory_logs l
+      WHERE DATE(l.created_at) = $1 AND l.change_amount < 0
+    `, [date]);
+    const totalCostoInsumos = Number(cRow.total);
+
+    // 3. Gastos agrupados por categoría
+    const { rows: gRows } = await client.query(
+      'SELECT category, SUM(monto) AS total FROM cuadre_gastos WHERE date=$1 GROUP BY category', [date]
+    );
+    const gastos = Object.fromEntries(gRows.map(g => [g.category, Number(g.total)]));
+
+    const gastosGenerales = gastos['generales'] || 0;
+    const gastosFondo     = gastos['fondo']     || 0;
+
+    // 4. P&L
+    const utilidadBruta = totalVentas - totalCostoInsumos;
+    const utilidadNeta  = utilidadBruta - gastosGenerales;
+    const parteBase     = utilidadNeta / 3;
+
+    // 5. Per-partner movement & fund update
+    const partners = ['jm', 'michel', 'nadiel'];
+    const movements = [];
+    for (const persona of partners) {
+      const gastosInd    = gastos[persona] || 0;
+      const utilidadFinal = parteBase - gastosInd;
+      await client.query(`
+        INSERT INTO partner_fund_movements (date,persona,ventas_parte,gastos_individuales,utilidad_final)
+        VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (date,persona) DO UPDATE
+          SET ventas_parte=$3, gastos_individuales=$4, utilidad_final=$5
+      `, [date, persona, parteBase, gastosInd, utilidadFinal]);
+      await client.query(
+        'UPDATE partner_funds SET saldo = saldo + $1, updated_at = CURRENT_TIMESTAMP WHERE persona = $2',
+        [utilidadFinal, persona]
+      );
+      movements.push({ persona, parteBase, gastosInd, utilidadFinal });
+    }
+
+    await client.query('COMMIT');
+
+    const { rows: fondosRows } = await pool.query('SELECT * FROM partner_funds ORDER BY persona');
+    res.json({ date, totalVentas, totalCostoInsumos, gastosGenerales, gastosFondo,
+               utilidadBruta, utilidadNeta, parteBase, movements, fondos: fondosRows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Cierre error:', err);
+    res.status(500).json({ message: 'Error al procesar el cierre.' });
+  } finally { client.release(); }
+});
+
+// ===================================
+//  DEUDAS
+// ===================================
+app.get('/api/deudas', authenticateToken, isAdmin, async (req, res) => {
+  const { rows } = await pool.query(
+    'SELECT * FROM debts ORDER BY is_paid ASC, date DESC, created_at DESC'
+  );
+  res.json(rows);
+});
+
+app.post('/api/deudas', authenticateToken, isAdmin, async (req, res) => {
+  const { tipo, concepto, persona, monto, date, notes } = req.body;
+  if (!['cobrar','pagar'].includes(tipo))      return bad(res, 'Tipo inválido. Usa "cobrar" o "pagar".');
+  if (!validate.string(concepto, 200))         return bad(res, 'Concepto inválido.');
+  if (isNaN(Number(monto)) || Number(monto) <= 0) return bad(res, 'Monto inválido.');
+  const useDate = date && validate.date(date) ? date : new Date().toISOString().split('T')[0];
+  const { rows } = await pool.query(
+    'INSERT INTO debts (tipo,concepto,persona,monto,date,notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+    [tipo, concepto.trim(), (persona||'').trim(), Number(monto), useDate, (notes||'').trim()]
+  );
+  res.status(201).json(rows[0]);
+});
+
+app.patch('/api/deudas/:id', authenticateToken, isAdmin, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return bad(res, 'ID inválido');
+  const { is_paid, concepto, monto, notes } = req.body;
+  const fields = [], values = [];
+  let i = 1;
+  if (typeof is_paid  !== 'undefined') { fields.push(`is_paid=$${i++}`);  values.push(!!is_paid); }
+  if (concepto !== undefined)          { fields.push(`concepto=$${i++}`); values.push(concepto.trim()); }
+  if (monto    !== undefined)          { fields.push(`monto=$${i++}`);    values.push(Number(monto)); }
+  if (notes    !== undefined)          { fields.push(`notes=$${i++}`);    values.push(notes.trim()); }
+  if (!fields.length) return bad(res, 'Sin campos para actualizar.');
+  values.push(id);
+  const { rows, rowCount } = await pool.query(`UPDATE debts SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, values);
+  if (rowCount === 0) return bad(res, 'Deuda no encontrada.', 404);
+  res.json(rows[0]);
+});
+
+app.delete('/api/deudas/:id', authenticateToken, isAdmin, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return bad(res, 'ID inválido');
+  const { rowCount } = await pool.query('DELETE FROM debts WHERE id=$1', [id]);
+  if (rowCount === 0) return bad(res, 'Deuda no encontrada.', 404);
   res.status(204).send();
 });
 
