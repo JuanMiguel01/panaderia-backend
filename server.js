@@ -525,12 +525,17 @@ app.get('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
 });
 
 app.post('/api/inventory', authenticateToken, isAdmin, async (req, res) => {
-  const { name, quantity, unit } = req.body;
+  const { name, quantity, unit, unit_cost } = req.body;
   if (!validate.string(name, 100))     return bad(res, 'Nombre inválido.');
   if (!validate.positiveNum(quantity)) return bad(res, 'Cantidad inválida.');
   if (!validate.string(unit, 20))      return bad(res, 'Unidad inválida.');
+  const cost = unit_cost !== undefined ? Number(unit_cost) : 0;
+  if (isNaN(cost) || cost < 0)         return bad(res, 'Costo unitario inválido.');
   try {
-    const { rows } = await pool.query('INSERT INTO inventory_items (name,quantity,unit) VALUES ($1,$2,$3) RETURNING *', [name.trim(), Number(quantity), unit.trim()]);
+    const { rows } = await pool.query(
+      'INSERT INTO inventory_items (name,quantity,unit,unit_cost) VALUES ($1,$2,$3,$4) RETURNING *',
+      [name.trim(), Number(quantity), unit.trim(), cost]
+    );
     res.status(201).json(rows[0]);
   } catch (err) {
     if (err.code === '23505') return bad(res, 'El insumo ya existe.');
