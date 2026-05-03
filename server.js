@@ -92,9 +92,12 @@ async function initDB() {
   `);
   const { rows: pfRows } = await pool.query('SELECT COUNT(*) FROM partner_funds');
   if (parseInt(pfRows[0].count) === 0) {
-    for (const p of ['jm', 'michel', 'nadiel'])
+    for (const p of ['jm', 'michel', 'nadiel', 'general'])
       await pool.query('INSERT INTO partner_funds (persona) VALUES ($1)', [p]);
     console.log('✅ Fondos de socios creados');
+  } else {
+    // Ensure 'general' exists for existing deployments
+    await pool.query(`INSERT INTO partner_funds (persona) VALUES ('general') ON CONFLICT (persona) DO NOTHING`);
   }
 
   await pool.query(`
@@ -684,7 +687,7 @@ app.get('/api/fondos', authenticateToken, isAdmin, async (req, res) => {
 // Manual adjustment of a partner's fund (e.g. to set initial balance)
 app.patch('/api/fondos/:persona', authenticateToken, isAdmin, async (req, res) => {
   const { persona } = req.params;
-  if (!['jm','michel','nadiel'].includes(persona)) return bad(res, 'Persona inválida.');
+  if (!['jm','michel','nadiel','general'].includes(persona)) return bad(res, 'Persona inválida.');
   const { saldo } = req.body;
   if (isNaN(Number(saldo))) return bad(res, 'Saldo inválido.');
   const { rows } = await pool.query(
@@ -751,6 +754,12 @@ app.post('/api/fondos/cierre/:date', authenticateToken, isAdmin, async (req, res
       );
       movements.push({ persona, parteBase, gastosInd, utilidadFinal });
     }
+
+    // 6. General fund = cash position: prev + ventas - gastos_fondo
+    await client.query(
+      'UPDATE partner_funds SET saldo = saldo + $1, updated_at = CURRENT_TIMESTAMP WHERE persona = $2',
+      [totalVentas - gastosFondo, 'general']
+    );
 
     await client.query('COMMIT');
 
