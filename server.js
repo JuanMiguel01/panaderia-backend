@@ -28,6 +28,15 @@ pool.on('error', (err) => console.error('Unexpected DB error', err));
 // ── Auto-create bread_presets table + seed defaults ───────
 async function initDB() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS sync_operations (
+      client_id    VARCHAR(36) PRIMARY KEY,
+      op_type      VARCHAR(50) NOT NULL,
+      result_id    INTEGER,
+      processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS bread_presets (
       id         SERIAL PRIMARY KEY,
       name       VARCHAR(100) NOT NULL UNIQUE,
@@ -819,6 +828,271 @@ app.delete('/api/deudas/:id', authenticateToken, isAdmin, async (req, res) => {
   const { rowCount } = await pool.query('DELETE FROM debts WHERE id=$1', [id]);
   if (rowCount === 0) return bad(res, 'Deuda no encontrada.', 404);
   res.status(204).send();
+});
+
+// ===================================
+//  OFFLINE SYNC
+// ===================================
+app.post('/api/sync', authenticateToken, async (req, res) => {
+  const { operations } = req.body;
+  if (!Array.isArray(operations) || operations.length === 0)
+    return bad(res, 'operations debe ser un array no vacío.');
+  if (operations.length > 100)
+    return bad(res, 'Máximo 100 operaciones por sync.');
+
+  const results = [];
+  const idMap = {}; // clientId → serverId para referencias cruzadas dentro del mismo sync
+
+  for (const op of operations) {
+    const { id: clientId, type, payload } = op;
+
+    if (!clientId || typeof clientId !== 'string') {
+      results.push({ clientId, status: 'error', error: 'id requerido' });
+      continue;
+    }
+    if (!type || !payload) {
+      results.push({ clientId, status: 'error', error: 'type y payload requeridos' });
+      continue;
+    }
+
+    // Idempotencia: ¿ya fue procesada esta operación?
+    try {
+      const { rows: existing } = await pool.query(
+        'SELECT result_id FROM sync_operations WHERE client_id=$1', [clientId]
+      );
+      if (existing.length > 0) {
+        const resultId = existing[0].result_id;
+        if (resultId != null) idMap[clientId] = resultId;
+        results.push({ clientId, status: 'already_synced', resultId });
+        continue;
+      }
+    } catch {
+      results.push({ clientId, status: 'error', error: 'Error de idempotencia.' });
+      continue;
+    }
+
+    let resultId = null;
+
+    try {
+      switch (type) {
+
+        case 'batch:create': {
+          const { breadType, quantityMade, price, date } = payload;
+          if (!validate.string(breadType))         throw new Error('Tipo de pan inválido.');
+          if (!validate.positiveInt(quantityMade)) throw new Error('Cantidad inválida.');
+          if (!validate.positiveNum(price))        throw new Error('Precio inválido.');
+          const usarFecha = date && validate.date(date);
+          const q = usarFecha
+            ? 'INSERT INTO bread_batches (bread_type,quantity_made,price,created_by,date) VALUES ($1,$2,$3,$4,$5) RETURNING id'
+            : 'INSERT INTO bread_batches (bread_type,quantity_made,price,created_by) VALUES ($1,$2,$3,$4) RETURNING id';
+          const p = usarFecha
+            ? [breadType.trim(), Number(quantityMade), Number(price), req.user.userId, date]
+            : [breadType.trim(), Number(quantityMade), Number(price), req.user.userId];
+          const { rows } = await pool.query(q, p);
+          resultId = rows[0].id;
+          break;
+        }
+
+        case 'sale:create': {
+          // batchId puede ser un clientId temporal resuelto por idMap
+          let batchId = payload.batchId;
+          if (typeof batchId === 'string' && idMap[batchId]) batchId = idMap[batchId];
+          batchId = parseInt(batchId);
+          const { personName, quantitySold, isGift } = payload;
+          if (isNaN(batchId))                      throw new Error('Batch ID inválido.');
+          if (!validate.string(personName, 100))   throw new Error('Nombre inválido.');
+          if (!validate.positiveInt(quantitySold)) throw new Error('Cantidad inválida.');
+
+          const { rows: batchRows } = await pool.query('SELECT quantity_made FROM bread_batches WHERE id=$1', [batchId]);
+          if (!batchRows[0]) throw new Error('Lote no encontrado.');
+          const { rows: soldRows } = await pool.query(
+            'SELECT COALESCE(SUM(quantity_sold),0) AS total FROM sales WHERE batch_id=$1', [batchId]
+          );
+          const remaining = batchRows[0].quantity_made - parseInt(soldRows[0].total);
+          if (quantitySold > remaining)
+            throw new Error(`Solo quedan ${remaining} unidades disponibles en este lote.`);
+
+          const { rows } = await pool.query(
+            'INSERT INTO sales (batch_id,person_name,quantity_sold,created_by,is_gift) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+            [batchId, personName.trim(), quantitySold, req.user.userId, !!isGift]
+          );
+          resultId = rows[0].id;
+          break;
+        }
+
+        case 'sale:update': {
+          let saleId = payload.saleId;
+          if (typeof saleId === 'string' && idMap[saleId]) saleId = idMap[saleId];
+          saleId = parseInt(saleId);
+          if (isNaN(saleId)) throw new Error('Sale ID inválido.');
+          const { isPaid, isDelivered } = payload;
+          if (typeof isPaid !== 'undefined' && req.user.role !== 'admin')
+            throw new Error('Solo admins pueden cambiar el estado de pago.');
+          const fields = [], values = [];
+          let i = 1;
+          if (typeof isPaid      !== 'undefined') { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
+          if (typeof isDelivered !== 'undefined') { fields.push(`is_delivered=$${i++}`); values.push(isDelivered); }
+          if (!fields.length) throw new Error('Sin campos para actualizar.');
+          values.push(saleId);
+          const { rowCount } = await pool.query(`UPDATE sales SET ${fields.join(',')} WHERE id=$${i}`, values);
+          if (rowCount === 0) throw new Error('Venta no encontrada.');
+          resultId = saleId;
+          break;
+        }
+
+        case 'gasto:create': {
+          if (req.user.role !== 'admin') throw new Error('Solo admins pueden registrar gastos.');
+          const { date, category, concepto, monto } = payload;
+          if (!validate.date(date)) throw new Error('Fecha inválida.');
+          if (!['generales','jm','michel','nadiel','fondo'].includes(category)) throw new Error('Categoría inválida.');
+          if (isNaN(Number(monto)) || Number(monto) < 0) throw new Error('Monto inválido.');
+          const { rows } = await pool.query(
+            'INSERT INTO cuadre_gastos (date,category,concepto,monto,created_by) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+            [date, category, (concepto || '').trim(), Number(monto), req.user.userId]
+          );
+          resultId = rows[0].id;
+          break;
+        }
+
+        case 'deuda:create': {
+          if (req.user.role !== 'admin') throw new Error('Solo admins pueden registrar deudas.');
+          const { tipo, concepto, persona, monto, date, notes } = payload;
+          if (!['cobrar','pagar'].includes(tipo))      throw new Error('Tipo inválido.');
+          if (!validate.string(concepto, 200))         throw new Error('Concepto inválido.');
+          if (isNaN(Number(monto)) || Number(monto) <= 0) throw new Error('Monto inválido.');
+          const useDate = date && validate.date(date) ? date : new Date().toISOString().split('T')[0];
+          const { rows } = await pool.query(
+            'INSERT INTO debts (tipo,concepto,persona,monto,date,notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
+            [tipo, concepto.trim(), (persona||'').trim(), Number(monto), useDate, (notes||'').trim()]
+          );
+          resultId = rows[0].id;
+          break;
+        }
+
+        case 'deuda:update': {
+          if (req.user.role !== 'admin') throw new Error('Solo admins pueden actualizar deudas.');
+          let deudaId = payload.deudaId;
+          if (typeof deudaId === 'string' && idMap[deudaId]) deudaId = idMap[deudaId];
+          deudaId = parseInt(deudaId);
+          if (isNaN(deudaId)) throw new Error('Deuda ID inválido.');
+          const { is_paid, concepto, monto, notes } = payload;
+          const fields = [], values = [];
+          let i = 1;
+          if (typeof is_paid  !== 'undefined') { fields.push(`is_paid=$${i++}`);  values.push(!!is_paid); }
+          if (concepto !== undefined)          { fields.push(`concepto=$${i++}`); values.push(concepto.trim()); }
+          if (monto    !== undefined)          { fields.push(`monto=$${i++}`);    values.push(Number(monto)); }
+          if (notes    !== undefined)          { fields.push(`notes=$${i++}`);    values.push(notes.trim()); }
+          if (!fields.length) throw new Error('Sin campos para actualizar.');
+          values.push(deudaId);
+          const { rowCount } = await pool.query(`UPDATE debts SET ${fields.join(',')} WHERE id=$${i}`, values);
+          if (rowCount === 0) throw new Error('Deuda no encontrada.');
+          resultId = deudaId;
+          break;
+        }
+
+        case 'inventory:adjust': {
+          if (req.user.role !== 'admin') throw new Error('Solo admins pueden ajustar inventario.');
+          let itemId = payload.itemId;
+          if (typeof itemId === 'string' && idMap[itemId]) itemId = idMap[itemId];
+          itemId = parseInt(itemId);
+          const change = Number(payload.change);
+          if (isNaN(itemId) || isNaN(change) || change === 0) throw new Error('Datos inválidos.');
+          const purchaseCost = payload.unit_cost !== undefined ? Number(payload.unit_cost) : null;
+          const logDate = payload.log_date && validate.date(payload.log_date)
+            ? payload.log_date
+            : new Date().toISOString().split('T')[0];
+
+          const dbClient = await pool.connect();
+          try {
+            await dbClient.query('BEGIN');
+            const { rows: [item] } = await dbClient.query(
+              'SELECT quantity, unit_cost FROM inventory_items WHERE id=$1 FOR UPDATE', [itemId]
+            );
+            if (!item) { await dbClient.query('ROLLBACK'); throw new Error('Insumo no encontrado.'); }
+            const after    = Number(item.quantity) + change;
+            const currCost = Number(item.unit_cost) || 0;
+            const currQty  = Number(item.quantity);
+            let newUnitCost = currCost, logUnitCost = currCost;
+            if (change > 0 && purchaseCost !== null) {
+              newUnitCost = currQty <= 0
+                ? purchaseCost
+                : (currQty * currCost + change * purchaseCost) / (currQty + change);
+              logUnitCost = purchaseCost;
+            }
+            const logType = change > 0 ? 'purchase' : 'consume';
+            await dbClient.query('UPDATE inventory_items SET quantity=$1, unit_cost=$2 WHERE id=$3', [after, newUnitCost, itemId]);
+            await dbClient.query(
+              'INSERT INTO inventory_logs (item_id,user_id,change_amount,quantity_before,quantity_after,unit_cost,log_type,log_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+              [itemId, req.user.userId, change, item.quantity, after, logUnitCost, logType, logDate]
+            );
+            await dbClient.query('COMMIT');
+          } catch (e) {
+            await dbClient.query('ROLLBACK');
+            throw e;
+          } finally { dbClient.release(); }
+
+          resultId = itemId;
+          break;
+        }
+
+        default:
+          throw new Error(`Tipo de operación desconocido: ${type}`);
+      }
+
+      // Registrar como procesada (idempotencia futura)
+      await pool.query(
+        'INSERT INTO sync_operations (client_id, op_type, result_id) VALUES ($1,$2,$3)',
+        [clientId, type, resultId]
+      );
+      if (resultId != null) idMap[clientId] = resultId;
+      results.push({ clientId, status: 'success', resultId });
+
+    } catch (err) {
+      console.error(`Sync op error [${type}]:`, err.message);
+      results.push({ clientId, status: 'error', error: err.message });
+    }
+  }
+
+  const successCount = results.filter(r => r.status === 'success').length;
+  if (successCount > 0) {
+    io.emit('sync:completed', { userId: req.user.userId, count: successCount });
+  }
+
+  res.json({ results, idMap });
+});
+
+// ===================================
+//  REPORTE CSV (TEMPORAL)
+// ===================================
+app.get('/api/reports/ventas-csv', authenticateToken, isAdmin, async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT
+      TO_CHAR(b.date, 'YYYY-MM')       AS mes,
+      b.date::text                     AS fecha,
+      s.person_name                    AS cliente,
+      s.quantity_sold                  AS cantidad,
+      b.price                          AS precio_unitario,
+      (s.quantity_sold * b.price)      AS total,
+      CASE WHEN s.is_paid THEN 'Sí' ELSE 'No' END AS pagado
+    FROM sales s
+    JOIN bread_batches b ON s.batch_id = b.id
+    WHERE b.date >= '2026-01-01'
+      AND b.date <= CURRENT_DATE
+      AND s.is_gift = FALSE
+    ORDER BY b.date ASC, s.created_at ASC
+  `);
+
+  const escape = v => (String(v).includes(',') ? `"${v}"` : String(v));
+
+  const header = 'Mes,Fecha,Cliente,Cantidad,Precio Unitario,Total,Pagado';
+  const lines  = rows.map(r =>
+    [r.mes, r.fecha, escape(r.cliente), r.cantidad, r.precio_unitario, r.total, r.pagado].join(',')
+  );
+  const csv = '﻿' + [header, ...lines].join('\n');
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="ventas-enero-junio-2026.csv"');
+  res.send(csv);
 });
 
 // ===================================
