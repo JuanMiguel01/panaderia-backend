@@ -1069,14 +1069,14 @@ app.get('/api/reports/ventas-csv', authenticateToken, isAdmin, async (req, res) 
     SELECT
       TO_CHAR(b.date, 'YYYY-MM')       AS mes,
       b.date::text                     AS fecha,
-      s.person_name                    AS cliente,
+      COALESCE(s.person_name, '')       AS cliente,
       s.quantity_sold                  AS cantidad,
       b.price                          AS precio_unitario,
       (s.quantity_sold * b.price)      AS total,
       CASE WHEN s.is_paid THEN 'Sí' ELSE 'No' END AS pagado
     FROM sales s
     JOIN bread_batches b ON s.batch_id = b.id
-    WHERE b.date >= '2026-01-01'
+    WHERE b.date >= '2025-11-01'
       AND b.date <= CURRENT_DATE
       AND s.is_gift = FALSE
     ORDER BY b.date ASC, s.created_at ASC
@@ -1091,7 +1091,7 @@ app.get('/api/reports/ventas-csv', authenticateToken, isAdmin, async (req, res) 
   const csv = '﻿' + [header, ...lines].join('\n');
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', 'attachment; filename="ventas-enero-junio-2026.csv"');
+  res.setHeader('Content-Disposition', 'attachment; filename="ventas-nov2025-jun2026.csv"');
   res.send(csv);
 });
 
