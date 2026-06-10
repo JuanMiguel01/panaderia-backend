@@ -74,10 +74,12 @@ async function initDB() {
   }
 
   // ── Financial schema migrations (safe: IF NOT EXISTS / ADD COLUMN IF NOT EXISTS) ──
-  await pool.query(`ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(10,2) DEFAULT 0`);
-  await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS unit_cost DECIMAL(10,2) DEFAULT 0`);
-  await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS log_type  VARCHAR(20) DEFAULT 'adjust'`);
+  await pool.query(`ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS unit_cost  DECIMAL(10,2) DEFAULT 0`);
+  await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS unit_cost  DECIMAL(10,2) DEFAULT 0`);
+  await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS log_type   VARCHAR(20) DEFAULT 'adjust'`);
   await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS log_date   DATE DEFAULT CURRENT_DATE`);
+  await pool.query(`ALTER TABLE sales            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+  await pool.query(`ALTER TABLE debts            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cuadre_gastos (
@@ -455,6 +457,7 @@ app.patch('/api/batches/:batchId/sales/:saleId', authenticateToken, async (req, 
   if (typeof isPaid      !== 'undefined') { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
   if (typeof isDelivered !== 'undefined') { fields.push(`is_delivered=$${i++}`); values.push(isDelivered); }
   if (!fields.length) return bad(res, 'Sin campos para actualizar.');
+  fields.push(`updated_at=CURRENT_TIMESTAMP`);
   values.push(saleId);
   const { rows } = await pool.query(`UPDATE sales SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, values);
   const s = rows[0];
@@ -833,6 +836,140 @@ app.delete('/api/deudas/:id', authenticateToken, isAdmin, async (req, res) => {
 // ===================================
 //  OFFLINE SYNC
 // ===================================
+
+// GET /api/sync/snapshot — carga completa para trabajar sin internet
+app.get('/api/sync/snapshot', authenticateToken, async (req, res) => {
+  try {
+    const isAdminUser = req.user.role === 'admin';
+    const syncedAt    = new Date().toISOString();
+
+    const { rows: presets } = await pool.query(
+      'SELECT * FROM bread_presets WHERE is_active=TRUE ORDER BY sort_order ASC, name ASC'
+    );
+
+    const { rows: batchRows } = await pool.query(`
+      SELECT b.id AS batch_id, b.bread_type, b.quantity_made, b.price, b.date,
+             b.created_by, u.email AS created_by_email,
+             s.id AS sale_id, s.person_name, s.quantity_sold,
+             s.is_paid, s.is_delivered, s.is_gift, s.created_at AS sale_created_at
+      FROM bread_batches b
+      LEFT JOIN sales s ON b.id = s.batch_id
+      LEFT JOIN users u ON b.created_by = u.id
+      WHERE b.date >= CURRENT_DATE - INTERVAL '30 days'
+      ORDER BY b.date DESC, b.id DESC, s.created_at ASC
+    `);
+
+    const batchMap = {};
+    for (const row of batchRows) {
+      if (!batchMap[row.batch_id]) {
+        batchMap[row.batch_id] = {
+          id: row.batch_id, breadType: row.bread_type,
+          quantityMade: row.quantity_made, price: row.price,
+          date: row.date, createdBy: row.created_by_email, sales: []
+        };
+      }
+      if (row.sale_id) {
+        batchMap[row.batch_id].sales.push({
+          id: row.sale_id, personName: row.person_name,
+          quantitySold: row.quantity_sold, isPaid: row.is_paid,
+          isDelivered: row.is_delivered, isGift: row.is_gift,
+          createdAt: row.sale_created_at
+        });
+      }
+    }
+
+    const snapshot = { syncedAt, presets, batches: Object.values(batchMap) };
+
+    if (isAdminUser) {
+      const [{ rows: inventory }, { rows: debts }, { rows: fondos }, { rows: gastos }] =
+        await Promise.all([
+          pool.query('SELECT * FROM inventory_items ORDER BY name ASC'),
+          pool.query('SELECT * FROM debts ORDER BY is_paid ASC, date DESC, created_at DESC'),
+          pool.query('SELECT * FROM partner_funds ORDER BY persona ASC'),
+          pool.query(`SELECT * FROM cuadre_gastos WHERE date >= CURRENT_DATE - INTERVAL '7 days' ORDER BY date DESC, created_at ASC`),
+        ]);
+      Object.assign(snapshot, { inventory, debts, fondos, gastos });
+    }
+
+    res.json(snapshot);
+  } catch (err) {
+    console.error('Snapshot error:', err);
+    res.status(500).json({ message: 'Error al generar snapshot.' });
+  }
+});
+
+// GET /api/sync/changes?since=ISO_TIMESTAMP — delta: solo lo nuevo desde el último sync
+app.get('/api/sync/changes', authenticateToken, async (req, res) => {
+  const { since } = req.query;
+  if (!since || isNaN(Date.parse(since)))
+    return bad(res, 'Parámetro "since" requerido (ISO timestamp, ej: 2026-06-01T00:00:00.000Z).');
+
+  const sinceTs     = new Date(since).toISOString();
+  const isAdminUser = req.user.role === 'admin';
+  const syncedAt    = new Date().toISOString();
+
+  try {
+    const { rows: presets } = await pool.query(
+      'SELECT * FROM bread_presets WHERE updated_at > $1 AND is_active=TRUE ORDER BY sort_order ASC',
+      [sinceTs]
+    );
+
+    // Batches donde el lote o alguna venta fue creada/actualizada después de 'since'
+    const { rows: batchRows } = await pool.query(`
+      SELECT b.id AS batch_id, b.bread_type, b.quantity_made, b.price, b.date,
+             b.created_by, u.email AS created_by_email,
+             s.id AS sale_id, s.person_name, s.quantity_sold,
+             s.is_paid, s.is_delivered, s.is_gift, s.created_at AS sale_created_at
+      FROM bread_batches b
+      LEFT JOIN sales s ON b.id = s.batch_id
+      LEFT JOIN users u ON b.created_by = u.id
+      WHERE b.id IN (
+        SELECT DISTINCT bb.id FROM bread_batches bb
+        LEFT JOIN sales ss ON bb.id = ss.batch_id
+        WHERE bb.created_at > $1
+           OR ss.created_at > $1
+           OR ss.updated_at > $1
+      )
+      ORDER BY b.date DESC, b.id DESC, s.created_at ASC
+    `, [sinceTs]);
+
+    const batchMap = {};
+    for (const row of batchRows) {
+      if (!batchMap[row.batch_id]) {
+        batchMap[row.batch_id] = {
+          id: row.batch_id, breadType: row.bread_type,
+          quantityMade: row.quantity_made, price: row.price,
+          date: row.date, createdBy: row.created_by_email, sales: []
+        };
+      }
+      if (row.sale_id) {
+        batchMap[row.batch_id].sales.push({
+          id: row.sale_id, personName: row.person_name,
+          quantitySold: row.quantity_sold, isPaid: row.is_paid,
+          isDelivered: row.is_delivered, isGift: row.is_gift,
+          createdAt: row.sale_created_at
+        });
+      }
+    }
+
+    const changes = { syncedAt, presets, batches: Object.values(batchMap) };
+
+    if (isAdminUser) {
+      const { rows: debts } = await pool.query(
+        'SELECT * FROM debts WHERE created_at > $1 OR updated_at > $1 ORDER BY date DESC',
+        [sinceTs]
+      );
+      Object.assign(changes, { debts });
+    }
+
+    res.json(changes);
+  } catch (err) {
+    console.error('Changes error:', err);
+    res.status(500).json({ message: 'Error al obtener cambios.' });
+  }
+});
+
+// POST /api/sync — procesar operaciones encoladas offline
 app.post('/api/sync', authenticateToken, async (req, res) => {
   const { operations } = req.body;
   if (!Array.isArray(operations) || operations.length === 0)
@@ -933,10 +1070,39 @@ app.post('/api/sync', authenticateToken, async (req, res) => {
           if (typeof isPaid      !== 'undefined') { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
           if (typeof isDelivered !== 'undefined') { fields.push(`is_delivered=$${i++}`); values.push(isDelivered); }
           if (!fields.length) throw new Error('Sin campos para actualizar.');
+          fields.push(`updated_at=CURRENT_TIMESTAMP`);
           values.push(saleId);
           const { rowCount } = await pool.query(`UPDATE sales SET ${fields.join(',')} WHERE id=$${i}`, values);
           if (rowCount === 0) throw new Error('Venta no encontrada.');
           resultId = saleId;
+          break;
+        }
+
+        case 'sale:delete': {
+          const perms = req.user.permissions || getDefaultPermissions(req.user.role);
+          if (!perms.canDeleteSales && req.user.role !== 'admin')
+            throw new Error('Sin permiso para eliminar ventas.');
+          let saleId = payload.saleId;
+          if (typeof saleId === 'string' && idMap[saleId]) saleId = idMap[saleId];
+          saleId  = parseInt(saleId);
+          const batchId = parseInt(payload.batchId);
+          if (isNaN(saleId) || isNaN(batchId)) throw new Error('IDs inválidos.');
+          const { rowCount } = await pool.query(
+            'DELETE FROM sales WHERE id=$1 AND batch_id=$2', [saleId, batchId]
+          );
+          if (rowCount === 0) throw new Error('Venta no encontrada.');
+          resultId = saleId;
+          break;
+        }
+
+        case 'batch:delete': {
+          if (req.user.role !== 'admin') throw new Error('Solo admins pueden eliminar lotes.');
+          let batchId = payload.batchId;
+          if (typeof batchId === 'string' && idMap[batchId]) batchId = idMap[batchId];
+          batchId = parseInt(batchId);
+          if (isNaN(batchId)) throw new Error('Batch ID inválido.');
+          await pool.query('DELETE FROM bread_batches WHERE id=$1', [batchId]);
+          resultId = batchId;
           break;
         }
 
@@ -1068,7 +1234,8 @@ app.get('/api/reports/ventas-csv', authenticateToken, isAdmin, async (req, res) 
   const { rows } = await pool.query(`
     SELECT
       TO_CHAR(b.date, 'YYYY-MM')       AS mes,
-      b.date::text                     AS fecha,
+      TO_CHAR(b.date, 'YYYY-MM-DD')    AS fecha,
+      b.bread_type                     AS tipo_pan,
       COALESCE(s.person_name, '')       AS cliente,
       s.quantity_sold                  AS cantidad,
       b.price                          AS precio_unitario,
@@ -1084,9 +1251,9 @@ app.get('/api/reports/ventas-csv', authenticateToken, isAdmin, async (req, res) 
 
   const escape = v => (String(v).includes(',') ? `"${v}"` : String(v));
 
-  const header = 'Mes,Fecha,Cliente,Cantidad,Precio Unitario,Total,Pagado';
+  const header = 'Mes,Fecha,Tipo de Pan,Cliente,Cantidad,Precio Unitario,Total,Pagado';
   const lines  = rows.map(r =>
-    [r.mes, r.fecha, escape(r.cliente), r.cantidad, r.precio_unitario, r.total, r.pagado].join(',')
+    [r.mes, r.fecha, escape(r.tipo_pan), escape(r.cliente), r.cantidad, r.precio_unitario, r.total, r.pagado].join(',')
   );
   const csv = '﻿' + [header, ...lines].join('\n');
 
