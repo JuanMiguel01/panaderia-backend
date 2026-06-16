@@ -80,6 +80,7 @@ async function initDB() {
   await pool.query(`ALTER TABLE inventory_logs  ADD COLUMN IF NOT EXISTS log_date   DATE DEFAULT CURRENT_DATE`);
   await pool.query(`ALTER TABLE sales            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
   await pool.query(`ALTER TABLE debts            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+  await pool.query(`ALTER TABLE bread_presets    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cuadre_gastos (
