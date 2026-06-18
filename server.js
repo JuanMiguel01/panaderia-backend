@@ -1010,6 +1010,9 @@ app.post('/api/sync', authenticateToken, async (req, res) => {
     }
 
     let resultId = null;
+    // Si una operación necesita un estado distinto a "success" (p. ej. conflicto o
+    // ya-sincronizado por registro inexistente), lo deja aquí y se omite el push de éxito.
+    let opOverride = null;
 
     try {
       switch (type) {
@@ -1066,6 +1069,31 @@ app.post('/api/sync', authenticateToken, async (req, res) => {
           const { isPaid, isDelivered } = payload;
           if (typeof isPaid !== 'undefined' && req.user.role !== 'admin')
             throw new Error('Solo admins pueden cambiar el estado de pago.');
+
+          // ── Detección de conflictos (Last-Write-Wins con sesgo al servidor) ──
+          const opTimestamp = op.timestamp ? new Date(op.timestamp) : null;
+          const { rows: existingSale } = await pool.query('SELECT * FROM sales WHERE id=$1', [saleId]);
+          if (existingSale.length === 0) {
+            // La venta fue eliminada en el servidor mientras el cliente estaba offline.
+            opOverride = { clientId, status: 'conflict', conflict: { reason: 'deleted' } };
+            break;
+          }
+          const sale = existingSale[0];
+          const serverUpdatedAt = sale.updated_at ? new Date(sale.updated_at) : null;
+
+          if (opTimestamp && serverUpdatedAt && serverUpdatedAt > opTimestamp) {
+            // El servidor cambió la fila DESPUÉS de que el cliente encoló la operación.
+            const conflicts = [];
+            if (isPaid      !== undefined && sale.is_paid      !== isPaid)      conflicts.push({ field: 'isPaid',      serverValue: sale.is_paid,      clientValue: isPaid });
+            if (isDelivered !== undefined && sale.is_delivered !== isDelivered) conflicts.push({ field: 'isDelivered', serverValue: sale.is_delivered, clientValue: isDelivered });
+            if (conflicts.length > 0) {
+              // Mismo campo tocado por ambos → conflicto real, gana el servidor.
+              opOverride = { clientId, status: 'conflict', conflict: { reason: 'modified_on_server', fields: conflicts, serverUpdatedAt: sale.updated_at } };
+              break;
+            }
+            // Campos distintos (o sin diferencia real) → merge automático, se aplica abajo.
+          }
+
           const fields = [], values = [];
           let i = 1;
           if (typeof isPaid      !== 'undefined') { fields.push(`is_paid=$${i++}`);      values.push(isPaid); }
@@ -1091,7 +1119,11 @@ app.post('/api/sync', authenticateToken, async (req, res) => {
           const { rowCount } = await pool.query(
             'DELETE FROM sales WHERE id=$1 AND batch_id=$2', [saleId, batchId]
           );
-          if (rowCount === 0) throw new Error('Venta no encontrada.');
+          if (rowCount === 0) {
+            // La venta ya no existe: la eliminación es idempotente, no es un error.
+            opOverride = { clientId, status: 'already_synced', resultId: saleId };
+            break;
+          }
           resultId = saleId;
           break;
         }
@@ -1102,7 +1134,12 @@ app.post('/api/sync', authenticateToken, async (req, res) => {
           if (typeof batchId === 'string' && idMap[batchId]) batchId = idMap[batchId];
           batchId = parseInt(batchId);
           if (isNaN(batchId)) throw new Error('Batch ID inválido.');
-          await pool.query('DELETE FROM bread_batches WHERE id=$1', [batchId]);
+          const { rowCount } = await pool.query('DELETE FROM bread_batches WHERE id=$1', [batchId]);
+          if (rowCount === 0) {
+            // El lote ya no existe: eliminación idempotente.
+            opOverride = { clientId, status: 'already_synced', resultId: batchId };
+            break;
+          }
           resultId = batchId;
           break;
         }
@@ -1204,6 +1241,12 @@ app.post('/api/sync', authenticateToken, async (req, res) => {
 
         default:
           throw new Error(`Tipo de operación desconocido: ${type}`);
+      }
+
+      // Conflicto o ya-sincronizado: no se aplicó ningún cambio que registrar.
+      if (opOverride) {
+        results.push(opOverride);
+        continue;
       }
 
       // Registrar como procesada (idempotencia futura)
